@@ -1,0 +1,339 @@
+"""In-process pygpubench scorer -- the default benchmarking engine.
+
+pygpubench (https://github.com/gpu-mode/pygpubench) runs a kernel in a supervised
+subprocess (seccomp + landlock + mseal), defeats timer monkeypatching (its timing
+core is compiled C++), and detects L2/replay cheats via canaries + GPU-memory
+relocation. We use it as the *runtime* benchmark behind the orchestrator's score
+step -- the runtime half kernelguard's static scan can't cover.
+
+This module is the single entry point the orchestrator calls
+(``bench.score(problem, worktree)``); there is no CLI and no ``python -m`` path.
+pygpubench (and torch) are imported **lazily**: with pygpubench scoring turned off
+(``cfg.pygpubench=False``) the loop falls back to the plain ``score_command`` and
+needs neither, and a missing pygpubench degrades to a clear scoring error rather
+than breaking the loop's import.
+
+The contract a pygpubench problem ships in its problem dir:
+  * ``submission.py`` -- the editable kernel adapter; exposes the function named
+    by ``bench.submission_qualname`` (e.g. ``submission.kernel``). This is what the
+    agent edits (it is the problem's ``edit_files``).
+  * ``task.py`` -- defines ``generate_test_case(*, seed, **test_args)`` returning
+    ``((inputs...), (expected, atol, rtol))`` (the pygpubench test-case contract).
+    NOT agent-editable -- it is the scoring objective.
+  * optionally ``baseline.py`` -- a reference kernel (e.g. ``torch.matmul``) whose
+    measured time is the denominator for a ``pct_baseline`` / ``speedup`` metric.
+
+The qualname is resolved by *import* inside pygpubench's subprocess, so the
+worktree's problem dir must be importable there. We maximise that by (1) inserting
+it at ``sys.path[0]``, (2) exporting it on ``PYTHONPATH`` for any spawned child,
+and (3) ``chdir``-ing into it for the duration. Cached ``submission``/``task``/
+``baseline`` modules are purged around each call so a later worktree never reuses
+an earlier one's code (same module name, different file on disk).
+"""
+from __future__ import annotations
+
+import contextlib
+import importlib
+import json
+import os
+import re
+import signal
+import sys
+from pathlib import Path
+
+_JSON_OBJ = re.compile(r"\{.*\}")
+
+# pygpubench raises ``RuntimeError('Benchmark subprocess failed with exit code N')``
+# when the supervised benchmark process dies. A *negative* N is Python's convention
+# for "killed by signal -N" -- the actionable signal hides inside the message.
+_EXIT_CODE = re.compile(r"exit code (-?\d+)")
+
+# Common ways a CUDA kernel takes down the benchmark subprocess, with the most
+# likely cause for this workload (kernel editing) so the agent gets a next step.
+_SIGNAL_HINT = {
+    signal.SIGSEGV: "illegal memory access / out-of-bounds -- check indexing, "
+                    "launch grid/block bounds, and shared-memory sizes",
+    signal.SIGABRT: "abort() -- often a failed CUDA API check or libc++ assertion "
+                    "(e.g. cudaErrorIllegalAddress surfaced at sync)",
+    signal.SIGKILL: "killed -- usually out-of-memory (host or GPU) or the sandbox "
+                    "timeout; reduce allocation or kernel runtime",
+    signal.SIGBUS: "bus error -- misaligned access or bad memory mapping",
+    signal.SIGFPE: "arithmetic fault -- integer divide-by-zero in index math",
+    signal.SIGILL: "illegal instruction -- ABI/arch mismatch in the compiled kernel",
+}
+
+
+def _explain_bench_error(e: BaseException) -> str:
+    """Turn pygpubench's bare ``exit code -11`` into a signal-named, actionable line.
+
+    Falls back to the plain ``repr`` when the message has no decodable exit code
+    (so non-crash failures -- import errors, timeouts already labelled, etc. -- are
+    untouched)."""
+    m = _EXIT_CODE.search(str(e))
+    if not m:
+        return f"pygpubench score error: {e!r}"
+    code = int(m.group(1))
+    if code >= 0:
+        return f"pygpubench score error (subprocess exit code {code}): {e!r}"
+    try:
+        sig = signal.Signals(-code)
+    except ValueError:
+        return f"pygpubench score error (killed by signal {-code}): {e!r}"
+    hint = _SIGNAL_HINT.get(sig, "subprocess crashed")
+    return (f"benchmark subprocess crashed: {sig.name} (signal {-code}) -- {hint}. "
+            "This is a fault inside the kernel/submission, not a kernelthing bug.")
+
+
+def parse_score(stdout: str) -> tuple[bool, float | None]:
+    """Return (correct, metric) from the last JSON line emitted by a score command.
+
+    Used only by the ``cfg.pygpubench=False`` fallback (the plain ``score_command``
+    path). Tolerates extra non-JSON output (build logs etc.): scans bottom-up for
+    the last line that parses as a JSON object containing ``correct`` and ``metric``.
+    """
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            m = _JSON_OBJ.search(line)
+            if not m:
+                continue
+            line = m.group(0)
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "correct" in obj and "metric" in obj:
+            metric = obj["metric"]
+            try:
+                metric = float(metric)
+            except (TypeError, ValueError):
+                metric = None
+            return bool(obj["correct"]), metric
+    return False, None
+
+# Module names we own in a problem dir; purged before/after each scoring so two
+# worktrees with the same module name but different files never alias.
+_PROBLEM_MODULES = ("submission", "task", "baseline")
+
+# Benchmark defaults when the manifest's ``bench`` block omits them (the common
+# case -- a problem need only name its submission/baseline). A problem may
+# override any of them.
+DEFAULT_REPEATS = 5         # timed measurements per scoring (median is taken)
+DEFAULT_SEED = 0            # RNG seed handed to the test-case generator
+DEFAULT_TIMEOUT_S = 600     # per-benchmark wall-clock cap
+
+
+def available() -> bool:
+    """True if pygpubench can be imported (it and torch are optional deps)."""
+    try:
+        import pygpubench  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _purge_problem_modules() -> None:
+    for name in list(sys.modules):
+        if name in _PROBLEM_MODULES or name.split(".", 1)[0] in _PROBLEM_MODULES:
+            del sys.modules[name]
+
+
+@contextlib.contextmanager
+def _importable(prob_dir: Path):
+    """Make ``prob_dir`` importable in-process and for spawned children."""
+    prob_dir_str = str(prob_dir)
+    old_cwd = os.getcwd()
+    old_pp = os.environ.get("PYTHONPATH")
+    _purge_problem_modules()
+    sys.path.insert(0, prob_dir_str)
+    os.environ["PYTHONPATH"] = os.pathsep.join(
+        [prob_dir_str, *(old_pp.split(os.pathsep) if old_pp else [])])
+    try:
+        os.chdir(prob_dir_str)
+        yield
+    finally:
+        os.chdir(old_cwd)
+        with contextlib.suppress(ValueError):
+            sys.path.remove(prob_dir_str)
+        if old_pp is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = old_pp
+        _purge_problem_modules()
+
+
+def _do_bench(pygpubench, qualname, gen, args, repeats, seed, opts):
+    """One isolated benchmark; returns the BenchmarkResult or raises."""
+    return pygpubench.do_bench_isolated(
+        qualname, gen, dict(args), int(repeats), int(seed),
+        discard=True,
+        timeout=int(opts["timeout"]) if "timeout" in opts else DEFAULT_TIMEOUT_S,
+        landlock=bool(opts["landlock"]) if "landlock" in opts else True,
+        mseal=bool(opts["mseal"]) if "mseal" in opts else True,
+        allow_root=bool(opts["allow_root"]) if "allow_root" in opts else False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# pygpubench protocol adaptation
+# ---------------------------------------------------------------------------
+# pygpubench requires the kernel to mutate its *first* argument in-place (the
+# output buffer) and ignores the return value.  Problem authors write natural
+# signatures:  ``def kernel(A, B): return C`` and generators return
+# ``((A, B), (expected, ...))``.  We transparently adapt both sides.
+#
+# Generator wrapper: prepends a pre-allocated output buffer matching the
+# expected tensor so pygpubench's validation can compare against it.
+#
+# Kernel shim: a tiny module written into the problem directory that imports
+# the real kernel, calls it with the trailing args, and copies the return
+# value into the output buffer.  The shim qualifies as the pygpubench
+# submission qualname and is cleaned up after scoring.
+
+class _GeneratorAdapter:
+    """Adapts a natural generator to pygpubench's in-place protocol.
+
+    The instance is picklable because it references *gen* by its importable
+    qualified name (e.g. ``task.generate_test_case``).
+    """
+
+    def __init__(self, gen):
+        self._gen = gen
+
+    def __call__(self, **kwargs):
+        import torch
+        inputs, expected = self._gen(**kwargs)
+        output = torch.empty_like(expected[0])
+        return (output,) + tuple(inputs), expected
+
+
+def _shim_qualname(qualname: str, prob_dir: Path) -> tuple[str, Path]:
+    """Write a pygpubench-in-place shim for *qualname* into *prob_dir*.
+
+    Returns ``(shim_qualname, shim_path)``.  The caller must unlink
+    *shim_path* (and any ``.pyc`` sibling) after scoring.
+    """
+    module_name, __, func_name = qualname.rpartition(".")
+    safe = qualname.replace(".", "_")
+    shim_mod = f"_kt_shim_{safe}"
+    shim_path = prob_dir / f"{shim_mod}.py"
+    shim_path.write_text(f'''\
+import torch
+import {module_name} as _real
+_orig = _real.{func_name}
+def {func_name}(output, *args, **kwargs):
+    result = _orig(*args, **kwargs)
+    output.copy_(result)
+    return output
+''')
+    return f"{shim_mod}.{func_name}", shim_path
+
+
+def _cleanup_shim(shim_path: Path) -> None:
+    """Remove the shim file and any cached bytecode."""
+    for p in (shim_path, shim_path.with_suffix(".pyc")):
+        with contextlib.suppress(FileNotFoundError):
+            p.unlink()
+
+
+def _median_us(pygpubench, result) -> float | None:
+    if not result.success:
+        return None
+    return pygpubench.basic_stats(result.time_us).median
+
+
+def _derive_metric(pygpubench, problem, gen, args, repeats, seed, opts,
+                   cand_median: float, *, baseline_shim_q: str = "") -> tuple[float | None, str | None]:
+    """Turn the candidate's median time (us) into the problem's metric.
+
+    kinds:
+      * ``latency_us``        -> the median time itself (direction: minimize)
+      * ``tflops``            -> ``flops / (median_us * 1e6)`` (needs ``flops``)
+      * ``pct_baseline``      -> ``baseline_median / cand_median * 100`` -- e.g.
+        %cuBLAS when ``baseline_qualname`` benchmarks torch.matmul (equal FLOPs,
+        so the time ratio is the throughput ratio)
+      * ``speedup``           -> ``baseline_median / cand_median``
+    """
+    metric = problem.metric or {}
+    kind = metric["kind"] if "kind" in metric else "latency_us"
+    if kind == "latency_us":
+        return cand_median, None
+    if kind == "tflops":
+        flops = metric["flops"] if "flops" in metric else None
+        if not flops:
+            return None, "metric.kind=tflops requires metric.flops"
+        return float(flops) / (cand_median * 1e6), None
+    if kind in ("pct_baseline", "speedup"):
+        base_q = baseline_shim_q or metric.get("baseline_qualname", "")
+        if not base_q:
+            return None, f"metric.kind={kind} requires metric.baseline_qualname"
+        base_res = _do_bench(pygpubench, base_q, gen, args, repeats, seed, opts)
+        base_median = _median_us(pygpubench, base_res)
+        if base_median is None:
+            return None, f"baseline '{base_q}' failed: errors={base_res.errors}"
+        ratio = base_median / cand_median
+        return (ratio * 100.0 if kind == "pct_baseline" else ratio), None
+    return None, f"unknown metric.kind '{kind}'"
+
+
+def score(problem, worktree: Path) -> tuple[bool, float | None, str | None]:
+    """Benchmark the worktree's submission through pygpubench.
+
+    Returns ``(correct, metric, err)`` -- the same tuple the legacy
+    ``_score_worktree`` returns, so the orchestrator treats both scoring paths
+    identically. ``correct`` is pygpubench's ``result.success`` (every repeat
+    passed correctness within tolerance). Repeats are pygpubench's job (its
+    ``repeats`` arg), so the orchestrator does not loop this call.
+    """
+    try:
+        import pygpubench
+    except Exception as e:  # noqa: BLE001
+        return False, None, (
+            "pygpubench not installed (pip install 'kernelthing[pygpubench]'): "
+            f"{e!r}")
+
+    bench = problem.bench or {}
+    qualname = bench["submission_qualname"] if "submission_qualname" in bench else None
+    if not qualname:
+        return False, None, "problem.bench.submission_qualname is required"
+    prob_dir = Path(worktree) / problem.rel_dir
+    if not prob_dir.is_dir():
+        return False, None, f"problem dir not found in worktree: {prob_dir}"
+
+    task_module = bench["task_module"] if "task_module" in bench else "task"
+    generator = bench["generator"] if "generator" in bench else "generate_test_case"
+    test_args = bench["test_args"] if "test_args" in bench else {}
+    repeats = int(bench["repeats"] if "repeats" in bench else DEFAULT_REPEATS)
+    seed = int(bench["seed"] if "seed" in bench else DEFAULT_SEED)
+
+    try:
+        with _importable(prob_dir):
+            task_mod = importlib.import_module(task_module)
+            gen_raw = getattr(task_mod, generator)
+            gen = _GeneratorAdapter(gen_raw)
+
+            # Adapt qualnames to pygpubench's in-place protocol.
+            sub_shim_q, sub_shim_path = _shim_qualname(qualname, prob_dir)
+            base_shim_q = ""
+            base_shim_path = None
+            base_q = (problem.metric or {}).get("baseline_qualname", "")
+            if base_q:
+                base_shim_q, base_shim_path = _shim_qualname(base_q, prob_dir)
+
+            try:
+                cand_res = _do_bench(pygpubench, sub_shim_q, gen, test_args, repeats, seed, bench)
+                cand_median = _median_us(pygpubench, cand_res)
+                if cand_median is None:
+                    return False, None, f"submission failed correctness: errors={cand_res.errors}"
+                metric, err = _derive_metric(
+                    pygpubench, problem, gen, test_args, repeats, seed, bench,
+                    cand_median, baseline_shim_q=base_shim_q)
+                if err:
+                    return True, None, err   # ran + correct, but metric underivable
+                return True, metric, None
+            finally:
+                _cleanup_shim(sub_shim_path)
+                if base_shim_path:
+                    _cleanup_shim(base_shim_path)
+    except Exception as e:  # noqa: BLE001
+        return False, None, _explain_bench_error(e)

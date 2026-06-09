@@ -1,0 +1,110 @@
+"""Problem manifest: how kernelthing targets an arbitrary kernel problem.
+
+A *problem* is a directory inside a git repo containing a ``problem.json``
+manifest, a plan, the editable kernel file(s), and a self-contained ``score``
+command that builds + checks correctness against the problem's own baseline
+(cuBLAS, torch, a CPU reference, ...) and prints a JSON line:
+
+    {"correct": true, "metric": 88.0, "unit": "%cuBLAS", ...}
+
+kernelthing stays language/baseline-agnostic: it only runs the score command
+and reads that JSON. All paths the orchestrator uses are resolved relative to
+the enclosing git repo root (so worktrees and @file mentions work).
+"""
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass
+class Problem:
+    name: str
+    repo_root: Path          # git toplevel == orchestrator working dir
+    rel_dir: str             # problem dir, relative to repo_root
+    plan: str                # repo-relative path to the plan
+    edit_files: list[str]    # repo-relative paths the agent may edit
+    # Plain score command (cwd = <worktree>/<rel_dir>), used only when pygpubench
+    # scoring is turned off (cfg.pygpubench=False); pygpubench problems may leave
+    # it empty or point it at a self-test the agent runs.
+    score_command: str = ""
+    metric_name: str = "metric"
+    unit: str = ""
+    direction: str = "maximize"   # or "minimize"
+    bench_runs: int = 3
+    # pygpubench config: submission_qualname, task_module, generator,
+    # test_args, repeats, seed, timeout, landlock/mseal/allow_root. See bench.py.
+    bench: dict = field(default_factory=dict)
+    # metric derivation for pygpubench: kind + (flops|baseline_qualname).
+    metric: dict = field(default_factory=dict)
+
+    @property
+    def dir(self) -> Path:
+        return self.repo_root / self.rel_dir
+
+
+def _git_toplevel(path: Path) -> Path:
+    r = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"{path} is not inside a git repository")
+    return Path(r.stdout.strip())
+
+
+def load_problem(path: str | Path) -> Problem:
+    """Load a problem from a directory or a problem.json path."""
+    p = Path(path).resolve()
+    manifest = p / "problem.json" if p.is_dir() else p
+    if not manifest.is_file():
+        raise FileNotFoundError(f"no problem.json at {manifest}")
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    prob_dir = manifest.parent
+    repo_root = _git_toplevel(prob_dir)
+    rel_dir = str(prob_dir.relative_to(repo_root))
+
+    def repo_rel(rel_to_problem: str) -> str:
+        # manifest paths are relative to the problem dir; make them repo-relative
+        return str((Path(rel_dir) / rel_to_problem)) if rel_dir != "." else rel_to_problem
+
+    return Problem(
+        name=data["name"],
+        repo_root=repo_root,
+        rel_dir=rel_dir,
+        plan=repo_rel(data["plan"]),
+        edit_files=[repo_rel(f) for f in data["edit_files"]],
+        score_command=data["score_command"] if "score_command" in data else "",
+        metric_name=data["metric_name"] if "metric_name" in data else "metric",
+        unit=data["unit"] if "unit" in data else "",
+        direction=data["direction"] if "direction" in data else "maximize",
+        bench_runs=int(data["bench_runs"] if "bench_runs" in data else 3),
+        bench=dict(data["bench"] if "bench" in data else {}),
+        metric=dict(data["metric"] if "metric" in data else {}),
+    )
+
+
+def prepare_problem(problem: Problem, managed_root: Path) -> Problem:
+    """Copy the problem dir into a standalone git repo at ``managed_root/<name>/``
+    and return a new Problem rooted there. All worktrees branch from this repo,
+    so the source repo (kernelthing itself) is never touched."""
+    dest = managed_root / problem.name
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    for item in problem.dir.iterdir():
+        if item.name == "__pycache__":
+            continue
+        if item.is_dir():
+            shutil.copytree(item, dest / item.name, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, dest / item.name)
+
+    subprocess.run(["git", "init", "-b", "main"], cwd=dest, check=True,
+                   capture_output=True)
+    subprocess.run(["git", "add", "-A"], cwd=dest, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-m", "initial problem"],
+                   cwd=dest, check=True, capture_output=True)
+
+    return load_problem(dest / "problem.json")

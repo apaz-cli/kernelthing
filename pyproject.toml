@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kernelthing"
+version = "0.1.0"
+description = "Autonomous evolutionary GPU-kernel optimization loop driving the opencode agent."
+requires-python = ">=3.11"
+
+# The ``opencode`` CLI (and Node, for the guard plugin) are external prerequisites,
+# not pip deps.
+dependencies = [
+  "kernelguard",
+  "pygpubench>=0.0.3",
+  "torch",
+  "numpy",
+  "PyYAML>=6.0",
+]
+# pygpubench (+ torch) is the DEFAULT scoring engine (kernelthing/bench.py
+# runs each kernel in pygpubench's adversarial, sandboxed subprocess).
+# ``--no-pygpubench`` bypasses it for command-scored problems.
+[project.optional-dependencies]
+# Test / development tooling.
+dev = ["pytest"]
+
+[project.scripts]
+kernelthing = "kernelthing.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["kernelthing*"]
+
+# The opencode PreToolUse guard plugin ships inside the package (loaded by
+# opencode as an external plugin; see kernelthing/opencode_client.py).
+[tool.setuptools.package-data]
+kernelthing = ["oc_guard/*.js", "oc_guard/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

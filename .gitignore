@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Loop state / artifacts
+.humanize/
+# Best-of-N candidate summaries (read by the orchestrator, not committed)
+candidate-summary.md
+
+# Python build artifacts
+build/
+
+# CUDA build artifacts
+*.o
+*.obj
+*.cubin
+*.ptx
+# compiled bench binaries (problems build these; names vary)
+problems/**/harness/gemm_bench
+problems/**/*_bench
+
+# Profiler output (ncu-report-skill writes per-run dirs under profile/)
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+profile/
+
+# Editor / OS
+.DS_Store
+*.swp

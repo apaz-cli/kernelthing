@@ -1,0 +1,6 @@
+[submodule "vendor/KernelWiki"]
+	path = vendor/KernelWiki
+	url = https://github.com/mit-han-lab/KernelWiki.git
+[submodule "vendor/ncu-report-skill"]
+	path = vendor/ncu-report-skill
+	url = https://github.com/mit-han-lab/ncu-report-skill.git
