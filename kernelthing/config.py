@@ -66,9 +66,9 @@ class Config:
     wall_clock_s: int = 0         # wall-clock budget in seconds; 0 = off
     elite_k: int = 4              # size of the top-K frontier (the exploit pool)
     min_niches: int = 4           # below this many strategy niches, bias to explore
-    # bench.score is NOT concurrency-safe (in-process import + global GPU env), so
-    # this MUST stay 1 until benchmarking is made process-isolated per device.
-    bench_concurrency: int = 1
+    # GPU exclusivity is enforced by a per-device flock (kernelthing/gpulock.py),
+    # not in-process state, so agents and the bench never share the card -- even
+    # across separate kernelthing processes on the same physical GPU.
     evolve_seed: int = 0          # RNG seed for operator/parent sampling
     op_explore: float = 0.4       # base operator-selection weights
     op_exploit: float = 0.4

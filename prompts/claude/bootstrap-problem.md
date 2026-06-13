@@ -54,6 +54,26 @@ possible you must author:
    interactive, confirm the plan and every input/output shape and dtype with the
    operator before proceeding (see *Operating mode* above).
 
+   It **must** include a `## Build & test` section telling the optimizer how to
+   build and score the kernel — the single authoritative command, with the actual
+   problem dir filled in:
+
+   ```
+   ## Build & test
+   Build, run, and score the kernel with the authoritative benchmark:
+
+       kernelthing score {{TARGET_DIR}}
+
+   It prints `{"correct": ..., "metric": ..., "unit": ...}` — the same scoring
+   the loop uses every round. `"correct": true` with a sane metric means the
+   edit builds and passes correctness; read the `error` field on failure. (From
+   inside the problem dir, `kernelthing score .` is equivalent.)
+   ```
+
+   There is no separate build step or test harness to document — `kernelthing
+   score` compiles/loads the kernel and checks correctness itself. Do not invent
+   a different build/test command.
+
 3. **`task.py`** — define `generate_test_case(*, seed)` returning a tuple
     `((inputs...), (expected, atol, rtol))`. Bake the problem's shapes/dtypes
     directly into this function (no external args):

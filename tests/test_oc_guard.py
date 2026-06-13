@@ -229,3 +229,37 @@ def test_goal_tracker_mutable_change_allowed(tmp_path):
     ok = "## IMMUTABLE SECTION\n\nGoal: win\n\n## MUTABLE SECTION\n\n- task\n- new task\n"
     r = _decide(cfg, "write", {"filePath": str(tracker), "content": ok})
     assert not r["blocked"]
+
+
+# --- shared-GPU lock enforcement (bash) -------------------------------------
+
+def test_bash_ncu_unlocked_blocked(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "/usr/local/cuda/bin/ncu --set full ./bench"})
+    assert r["blocked"] and "gpu" in r["message"].lower()
+
+
+def test_bash_nsys_unlocked_blocked(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "nsys profile ./bench"})
+    assert r["blocked"]
+
+
+def test_bash_ncu_wrapped_allowed(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "flock /tmp/kt-gpu.lock ncu --set full ./bench"})
+    assert not r["blocked"]
+
+
+def test_bash_gpu_run_wrapped_allowed(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "/x/gpu_run.sh ncu --set full ./bench"})
+    assert not r["blocked"]
+
+
+def test_bash_ncu_report_parser_not_blocked(tmp_path):
+    # The CPU-only report parser lives under ncu-report-skill/ -- must NOT trip the
+    # GPU-tool matcher (it never touches the device).
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "python vendor/ncu-report-skill/helpers/analyze_reports.py --run-dir profile"})
+    assert not r["blocked"]

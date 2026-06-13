@@ -140,6 +140,31 @@ function checkWriteLike(cfg, filePath, resultingContent) {
   const abs = absPath(cfg, filePath);
   const nameLower = lower(baseName(abs));
 
+  // Edit-file enforcement: the agent may only write to the problem's designated
+  // edit_files (e.g. kernel.cu).  Other problem assets (task.py, submission.py,
+  // baseline.py, kernel_ref.cu, etc.) are protected.
+  if (cfg.editFiles && cfg.editFiles.length > 0 && cfg.editDir) {
+    const editDir = path.normalize(cfg.editDir) + path.sep;
+    const inEditDir = abs === path.normalize(cfg.editDir) || abs.startsWith(editDir);
+    if (inEditDir) {
+      const isEditFile = cfg.editFiles.some(f => abs === absPath(cfg, f));
+      const isProtected = (cfg.protectedFiles || []).some(f => lower(f) === nameLower);
+      const rel = path.relative(cfg.editDir, abs);
+      const hasBuildPrefix = rel.split(path.sep).some(seg => seg.startsWith("_"));
+      const isBuildArtifact = hasBuildPrefix || nameLower === ".gitignore" || nameLower === "bootstrap-prompt.md" || nameLower.startsWith(".humanize");
+      if (!isEditFile && !isBuildArtifact) {
+        return block(cfg, "edit-file-protected",
+          { EDIT_FILES: cfg.editFiles.join(", ") },
+          "# Edit Blocked\n\nOnly the designated edit files may be modified in this problem directory:\n\n  " + cfg.editFiles.join("\n  "));
+      }
+      if (isProtected) {
+        return block(cfg, "edit-file-protected",
+          { EDIT_FILES: cfg.editFiles.join(", ") },
+          "# Edit Blocked\n\nOnly the designated edit files may be modified in this problem directory:\n\n  " + cfg.editFiles.join("\n  "));
+      }
+    }
+  }
+
   // Methodology phase: only the two sanitized artifacts may be written.
   if (cfg.phase === "methodology") {
     if (inLoop(cfg, abs) &&
@@ -331,6 +356,19 @@ function checkBash(cfg, command) {
   // plan.md backup: only the copy living in the loop dir is protected.
   if (/\.humanize\b/.test(c) && commandModifiesFile(c, "plan\\.md")) {
     return block(cfg, "plan-backup-protected", {}, "The plan.md backup in the loop directory cannot be modified.");
+  }
+  // Shared-GPU serialization: GPU profilers must hold the per-device lock (run via
+  // the gpu-run wrapper / flock) so two agents never profile the same card at once.
+  // We can only *reliably* recognize the named GPU tools from a command string --
+  // matched as a bare or path-prefixed binary, so "ncu-report-skill" (the CPU-only
+  // report parser) is NOT caught -- and the prompt instructs gpu-run for plain
+  // benchmark binaries too. Commands already wrapped in flock/gpu-run are allowed.
+  const GPU_TOOL = /(?:^|[\s;&|(>])(?:[^\s;&|()]*\/)?(ncu|nv-nsight-cu-cli|nsys)(?:\s|$)/;
+  if (GPU_TOOL.test(c) && !/\b(flock|gpu[_-]run)\b/.test(c)) {
+    const gr = cfg.gpuRun || "gpu-run";
+    return block(cfg, "gpu-unlocked", { GPU_RUN: gr },
+      "Wrap GPU commands in the shared-GPU lock so only one agent uses the device " +
+      `at a time, e.g.  ${gr} ncu --set full ...`);
   }
   return null;
 }

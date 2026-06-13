@@ -20,12 +20,13 @@ branch from it; the orchestrator therefore does no further spec setup.
 """
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-from . import bench, gates, opencode_client, prompts
+from . import bench, gates, gpulock, opencode_client, prompts
 from .config import MARKER_COMPLETE, MARKER_SETUP_BLOCKED, Config
 from .problem import Problem, _git_toplevel, load_problem
 from .state import new_timestamp
@@ -128,6 +129,57 @@ def _render_prompt(objective: str | None, target: Path, repo_root: Path, *,
     )
 
 
+# The fully-rendered bootstrap prompt is kept next to the problem as a convenience
+# reference; ``.bootstrap-meta.json`` stores the inputs needed to re-render it, so
+# the loop can refresh that snapshot from the *current* template on every run rather
+# than letting a frozen copy drift from prompts/claude/bootstrap-problem.md.
+PROMPT_SNAPSHOT = "bootstrap-prompt.md"
+PROMPT_META = ".bootstrap-meta.json"
+
+
+def write_bootstrap_prompt(target: Path, repo_root: Path, objective: str | None,
+                           *, auto: bool) -> str:
+    """Render the bootstrap prompt from the current template and write it (plus the
+    inputs to re-render it later) into the problem dir. Returns the rendered text."""
+    prompt = _render_prompt(objective, target, repo_root, auto=auto)
+    (target / PROMPT_SNAPSHOT).write_text(prompt, encoding="utf-8")
+    (target / PROMPT_META).write_text(
+        json.dumps({"objective": objective or "", "auto": bool(auto)}),
+        encoding="utf-8")
+    return prompt
+
+
+def refresh_bootstrap_prompt(target: Path, repo_root: Path) -> bool:
+    """Re-render the ``bootstrap-prompt.md`` snapshot from the *current* template.
+
+    Reuses the persisted ``(objective, auto)`` when present (faithful re-render);
+    falls back to the neutral interactive prompt otherwise, so problems authored
+    before the metadata existed still pick up template changes. Best-effort and
+    idempotent: only refreshes a snapshot that already exists (never introduces one
+    into a hand-authored dir), only rewrites the prompt (never the metadata), and
+    swallows IO errors -- the snapshot is a convenience, never load-bearing. Returns
+    True iff it rewrote the snapshot.
+    """
+    meta_path = target / PROMPT_META
+    if not (target / PROMPT_SNAPSHOT).is_file() and not meta_path.is_file():
+        return False
+    objective: str | None = None
+    auto = False
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            objective = (meta.get("objective") or "") or None
+            auto = bool(meta.get("auto", False))
+        except (ValueError, OSError):
+            pass
+    try:
+        prompt = _render_prompt(objective, target, repo_root, auto=auto)
+        (target / PROMPT_SNAPSHOT).write_text(prompt, encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
 def _print_summary(target: Path, ok: bool, note: str | None) -> None:
     lines = ["", "-- Bootstrapped problem --", f"  dir: {target}"]
     manifest = target / "problem.json"
@@ -163,7 +215,8 @@ def _interactive_bootstrap(target: Path, repo_root: Path, prompt: str, cfg: Conf
         opencode_client.run_interactive(
             working_dir=repo_root, model=cfg.model,
             prompt=prompt if first else None, continue_last=not first,
-            gpu_index=cfg.gpu_index, writable=True, sandboxed=cfg.sandbox, ncu=cfg.ncu)
+            gpu_index=cfg.gpu_index, writable=True, sandboxed=cfg.sandbox, ncu=cfg.ncu,
+            gpu_lock=gpulock.lock_path(cfg.gpu_index))
         first = False
         ok, note, _ = _validate(target)
         _print_summary(target, ok, note)
@@ -205,11 +258,11 @@ def bootstrap_problem(objective: str | None, *, cfg: Config, auto: bool,
 
     # Keep the bootstrap artifacts next to the problem for debugging, but out of the
     # commit (``git add <dir>`` honours this .gitignore for untracked files).
-    (target / ".gitignore").write_text("bootstrap-prompt.md\nbootstrap-opencode.log\n",
-                                       encoding="utf-8")
+    (target / ".gitignore").write_text(
+        f"{PROMPT_SNAPSHOT}\n{PROMPT_META}\nbootstrap-opencode.log\n",
+        encoding="utf-8")
 
-    prompt = _render_prompt(objective, target, repo_root, auto=auto)
-    (target / "bootstrap-prompt.md").write_text(prompt, encoding="utf-8")
+    prompt = write_bootstrap_prompt(target, repo_root, objective, auto=auto)
 
     if auto:
         # No operator to converse with: run the agent headless and accept on validation.
@@ -217,7 +270,8 @@ def bootstrap_problem(objective: str | None, *, cfg: Config, auto: bool,
             prompt, working_dir=repo_root, model=cfg.model, session=None,
             timeout=cfg.opencode_timeout, gpu_index=cfg.gpu_index,
             writable=True, sandboxed=cfg.sandbox,
-            log_path=target / "bootstrap-opencode.log", ncu=cfg.ncu)
+            log_path=target / "bootstrap-opencode.log", ncu=cfg.ncu,
+            gpu_lock=gpulock.lock_path(cfg.gpu_index))
         if gates.has_setup_blocked(res.text):
             raise RuntimeError("bootstrap: --auto-setup agent emitted SETUP_BLOCKED -- cannot "
                                "author the problem from the given objective:\n"

@@ -12,8 +12,9 @@ Typical loop (do this in a scratch `profile/` dir — it is gitignored; never co
 
 ```bash
 # 1. Build the kernel with -lineinfo (the gemm harness Makefile already uses it).
-# 2. Overview profile + per-line stalls:
-{{NCU_BIN}} --set full -o profile/run1 --force-overwrite ./your_bench <args>
+# 2. Overview profile + per-line stalls. ncu runs ON the GPU, so wrap it in the
+#    shared-GPU lock ({{GPU_RUN}}) -- unwrapped profilers are rejected:
+{{GPU_RUN}} {{NCU_BIN}} --set full -o profile/run1 --force-overwrite ./your_bench <args>
 # 3. Parse with the helpers (the ncu_report module needs this PYTHONPATH). Each
 #    helper takes --run-dir (analysis is written under <run-dir>/analysis/) plus
 #    a --report/--tag pair per .ncu-rep; pass the pair again to compare two runs:

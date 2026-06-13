@@ -31,13 +31,13 @@ _BANNER_ART = r"""
   \ \ \\`\  /\  __/ \ \ \/  /\ \/\ \ /\  __/   \_\ \_ \ \ \_  \ \ \ \ \ \ \ \ /\ \/\ \ /\ \L\ \
    \ \_\ \_\\ \____\ \ \_\  \ \_\ \_\\ \____\  /\____\ \ \__\  \ \_\ \_\ \ \_\\ \_\ \_\\ \____ \
     \/_/\/_/ \/____/  \/_/   \/_/\/_/ \/____/  \/____/  \/__/   \/_/\/_/  \/_/ \/_/\/_/ \/___L\ \
-        Evolutionary Autoresearch and Optimization of GPU Kernels.                        /\____/
+        Evolutionary Autoresearch Optimization of GPU Kernels.                            /\____/
                                                                                           \/___/
 """
 
 # bright green for the figlet, bright blue for the tagline prose.
 _GREEN, _BLUE, _RESET = "\033[92m", "\033[94m", "\033[0m"
-_TAGLINE = "Evolutionary Autoresearch and Optimization of GPU Kernels."
+_TAGLINE = "Evolutionary Autoresearch Optimization of GPU Kernels."
 
 
 def _colorize_banner(art: str) -> str:
@@ -63,7 +63,7 @@ def _duration(text: str) -> int:
     ``1d``, ``90s``); a bare number is seconds. ``0`` means 'off'. This exists
     because bare-seconds was a footgun -- ``-w 10`` reads as 10 *seconds*, not the
     10 minutes one might expect."""
-    from .config import parse_duration
+    from .config import format_duration, parse_duration
 
     try:
         return parse_duration(text)
@@ -103,6 +103,9 @@ def _resolve_problem(args: argparse.Namespace, cfg: Config):
         if (p.is_dir() and (p / "problem.json").is_file()) or \
                 (p.is_file() and p.name == "problem.json"):
             problem = load_problem(p)
+            # Keep the problem's bootstrap-prompt.md snapshot current with the live
+            # template before the run copies the dir (the copy inherits the refresh).
+            bootstrap.refresh_bootstrap_prompt(problem.dir, problem.repo_root)
             return prepare_problem(problem, cfg.problem_root)
         if p.exists():
             raise RuntimeError(f"{src} exists but is not a problem dir (no problem.json); "
@@ -145,10 +148,19 @@ def _run(args: argparse.Namespace) -> int:
         bus = LoopBus(args.parallelism, args.wall_clock)
         try:
             _httpd, port = webui.start_server(bus, port=args.web_port)
-            print(f"[kernelthing] web UI: http://127.0.0.1:{port}", file=sys.stderr)
+            print(f"[kernelthing] web UI:   http://127.0.0.1:{port}", file=sys.stderr)
         except OSError as e:
             print(f"[kernelthing] web UI disabled ({e}); continuing headless", file=sys.stderr)
             bus = None
+    else:
+        print(f"[kernelthing] running headless (--no-web)", file=sys.stderr)
+
+    print(f"[kernelthing] problem:   {problem.name}", file=sys.stderr)
+    print(f"[kernelthing] artifacts: {problem.repo_root}", file=sys.stderr)
+    from .config import format_duration
+    wall_str = format_duration(args.wall_clock) if args.wall_clock else "none"
+    budget_str = f"{args.max_candidates} candidates" if args.max_candidates else "unbounded"
+    print(f"[kernelthing] agents:    {args.parallelism}  wall: {wall_str}  budget: {budget_str}", file=sys.stderr)
 
     orch = Orchestrator(problem, cfg, bus)
     try:

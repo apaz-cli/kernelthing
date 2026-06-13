@@ -80,7 +80,8 @@ tasks like benchmarking, and allows us to maintain idea diversity.
 - a **controller** owns the population/archive and a task queue;
 - a pool of **mutation workers** (many, concurrent) each take a parent + operator,
   edit in an isolated worktree, and submit the result;
-- a **benchmark queue** (concurrency = number of GPUs) is the one serialized stage.
+- **all GPU access is serialized** by a per-device lock — not just the
+  authoritative benchmark, but every agent's own build/run/profile too.
 
 Results flow back continuously, so the GPU is always fed and agents always working.
 
@@ -102,7 +103,15 @@ only *allocates compute*; the measured score still decides what is elite.
 
 **Honesty**: the measured benchmark is the only thing that decides what is elite or
 gets promoted. The run stops on a global budget (wall-clock / candidate count), not a
-round count. `-j` sets max concurrent agents; the GPU benchmark stays serialized.
+round count. `-j` sets max concurrent agents; all GPU work stays serialized.
+
+**One GPU at a time.** A per-device `flock` (`kernelthing/gpulock.py`) keyed on the
+physical GPU **UUID** (not the CUDA index, which is relative to each process's
+`CUDA_VISIBLE_DEVICES`) gates every GPU command — the authoritative benchmark and
+each agent's own runs/`ncu` profiles, which go through a `gpu-run` wrapper bound
+into the sandbox. So nothing ever contends on the device, even across separate
+kernelthing processes targeting the same card. Multi-GPU is one process per device
+(`--gpu N` / `CUDA_VISIBLE_DEVICES=N`); each acquires only its own card's lock.
 
 ## Sandboxing
 

@@ -12,7 +12,7 @@ requires-python = ">=3.11"
 # not pip deps.
 dependencies = [
   "kernelguard",
-  "pygpubench>=0.0.3",
+  "pygpubench @ git+https://github.com/apaz-cli/pygpubench",
   "torch",
   "numpy",
   "PyYAML>=6.0",

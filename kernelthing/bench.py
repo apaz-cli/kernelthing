@@ -162,8 +162,11 @@ def _importable(prob_dir: Path):
         _purge_problem_modules()
 
 
-def _do_bench(pygpubench, qualname, gen, args, repeats, seed, opts):
+def _do_bench(pygpubench, qualname, gen, args, repeats, seed, opts,
+              writable_paths=None):
     """One isolated benchmark; returns the BenchmarkResult or raises."""
+    if writable_paths is None:
+        writable_paths = list(opts.get("writable_paths", ["/tmp"]))
     return pygpubench.do_bench_isolated(
         qualname, gen, dict(args), int(repeats), int(seed),
         discard=True,
@@ -171,6 +174,7 @@ def _do_bench(pygpubench, qualname, gen, args, repeats, seed, opts):
         landlock=bool(opts["landlock"]) if "landlock" in opts else True,
         mseal=bool(opts["mseal"]) if "mseal" in opts else True,
         allow_root=bool(opts["allow_root"]) if "allow_root" in opts else False,
+        writable_paths=writable_paths,
     )
 
 
@@ -243,7 +247,9 @@ def _median_us(pygpubench, result) -> float | None:
 
 
 def _derive_metric(pygpubench, problem, gen, args, repeats, seed, opts,
-                   cand_median: float, *, baseline_shim_q: str = "") -> tuple[float | None, str | None]:
+                   cand_median: float, *, baseline_shim_q: str = "",
+                   pinned_baseline: float | None = None,
+                   writable_paths=None) -> tuple[float | None, str | None]:
     """Turn the candidate's median time (us) into the problem's metric.
 
     kinds:
@@ -253,6 +259,13 @@ def _derive_metric(pygpubench, problem, gen, args, repeats, seed, opts,
         %cuBLAS when ``baseline_qualname`` benchmarks torch.matmul (equal FLOPs,
         so the time ratio is the throughput ratio)
       * ``speedup``           -> ``baseline_median / cand_median``
+
+    ``pinned_baseline`` (us): when given, used as the fixed denominator for
+    ``pct_baseline`` / ``speedup`` instead of re-benchmarking the baseline here.
+    The orchestrator measures the baseline once per run (see ``measure_baseline``)
+    and pins it so every candidate shares one denominator -- the baseline is then
+    definitionally 100% and identical kernels score identically rather than
+    drifting with per-scoring GPU noise.
     """
     metric = problem.metric or {}
     kind = metric["kind"] if "kind" in metric else "latency_us"
@@ -264,19 +277,74 @@ def _derive_metric(pygpubench, problem, gen, args, repeats, seed, opts,
             return None, "metric.kind=tflops requires metric.flops"
         return float(flops) / (cand_median * 1e6), None
     if kind in ("pct_baseline", "speedup"):
-        base_q = baseline_shim_q or metric.get("baseline_qualname", "")
-        if not base_q:
-            return None, f"metric.kind={kind} requires metric.baseline_qualname"
-        base_res = _do_bench(pygpubench, base_q, gen, args, repeats, seed, opts)
-        base_median = _median_us(pygpubench, base_res)
-        if base_median is None:
-            return None, f"baseline '{base_q}' failed: errors={base_res.errors}"
+        if pinned_baseline is not None:
+            base_median = pinned_baseline
+        else:
+            base_q = baseline_shim_q or metric.get("baseline_qualname", "")
+            if not base_q:
+                return None, f"metric.kind={kind} requires metric.baseline_qualname"
+            base_res = _do_bench(pygpubench, base_q, gen, args, repeats, seed, opts,
+                                 writable_paths=writable_paths)
+            base_median = _median_us(pygpubench, base_res)
+            if base_median is None:
+                return None, f"baseline '{base_q}' failed: errors={base_res.errors}"
         ratio = base_median / cand_median
         return (ratio * 100.0 if kind == "pct_baseline" else ratio), None
     return None, f"unknown metric.kind '{kind}'"
 
 
-def score(problem, worktree: Path) -> tuple[bool, float | None, str | None]:
+def measure_baseline(problem, worktree: Path) -> tuple[float | None, str | None]:
+    """Benchmark the baseline reference kernel once, returning ``(median_us, err)``.
+
+    The baseline (e.g. ``torch.matmul``) is the fixed denominator for
+    ``pct_baseline`` / ``speedup`` metrics. The orchestrator calls this once at
+    run start and pins the result into every ``score(..., baseline_median=...)``
+    call, so the baseline is definitionally 100% and candidate percentages share
+    one denominator instead of drifting with per-scoring GPU noise.
+
+    Returns ``(None, None)`` when the problem declares no baseline qualname
+    (nothing to pin); ``(None, err)`` on failure, so the caller can fall back to
+    per-candidate baseline measurement.
+    """
+    try:
+        import pygpubench
+    except Exception as e:  # noqa: BLE001
+        return None, f"pygpubench not installed: {e!r}"
+
+    base_q = (problem.metric or {}).get("baseline_qualname", "")
+    if not base_q:
+        return None, None
+    bench = problem.bench or {}
+    prob_dir = Path(worktree) / problem.rel_dir
+    if not prob_dir.is_dir():
+        return None, f"problem dir not found in worktree: {prob_dir}"
+
+    task_module = bench["task_module"] if "task_module" in bench else "task"
+    generator = bench["generator"] if "generator" in bench else "generate_test_case"
+    test_args = bench["test_args"] if "test_args" in bench else {}
+    repeats = int(bench["repeats"] if "repeats" in bench else DEFAULT_REPEATS)
+    seed = int(bench["seed"] if "seed" in bench else DEFAULT_SEED)
+
+    try:
+        with _importable(prob_dir):
+            task_mod = importlib.import_module(task_module)
+            gen = _GeneratorAdapter(getattr(task_mod, generator))
+            base_shim_q, base_shim_path = _shim_qualname(base_q, prob_dir)
+            try:
+                res = _do_bench(pygpubench, base_shim_q, gen, test_args, repeats, seed,
+                                bench, writable_paths=[str(prob_dir)])
+                median = _median_us(pygpubench, res)
+                if median is None:
+                    return None, f"baseline '{base_q}' failed: errors={res.errors}"
+                return median, None
+            finally:
+                _cleanup_shim(base_shim_path)
+    except Exception as e:  # noqa: BLE001
+        return None, _explain_bench_error(e)
+
+
+def score(problem, worktree: Path, *,
+          baseline_median: float | None = None) -> tuple[bool, float | None, str | None]:
     """Benchmark the worktree's submission through pygpubench.
 
     Returns ``(correct, metric, err)`` -- the same tuple the legacy
@@ -284,6 +352,11 @@ def score(problem, worktree: Path) -> tuple[bool, float | None, str | None]:
     identically. ``correct`` is pygpubench's ``result.success`` (every repeat
     passed correctness within tolerance). Repeats are pygpubench's job (its
     ``repeats`` arg), so the orchestrator does not loop this call.
+
+    ``baseline_median`` (us): a pinned denominator for ``pct_baseline`` /
+    ``speedup`` metrics. When given, the baseline reference kernel is NOT
+    re-benchmarked here -- the run measures it once (``measure_baseline``) and
+    reuses it so every candidate is scored against one fixed baseline.
     """
     try:
         import pygpubench
@@ -317,17 +390,22 @@ def score(problem, worktree: Path) -> tuple[bool, float | None, str | None]:
             base_shim_q = ""
             base_shim_path = None
             base_q = (problem.metric or {}).get("baseline_qualname", "")
-            if base_q:
+            # Skip shimming the baseline when its time is already pinned -- nothing
+            # in this call will re-benchmark it.
+            if base_q and baseline_median is None:
                 base_shim_q, base_shim_path = _shim_qualname(base_q, prob_dir)
 
             try:
-                cand_res = _do_bench(pygpubench, sub_shim_q, gen, test_args, repeats, seed, bench)
+                writable = [str(prob_dir)]
+                cand_res = _do_bench(pygpubench, sub_shim_q, gen, test_args, repeats, seed, bench,
+                                     writable_paths=writable)
                 cand_median = _median_us(pygpubench, cand_res)
                 if cand_median is None:
                     return False, None, f"submission failed correctness: errors={cand_res.errors}"
                 metric, err = _derive_metric(
                     pygpubench, problem, gen, test_args, repeats, seed, bench,
-                    cand_median, baseline_shim_q=base_shim_q)
+                    cand_median, baseline_shim_q=base_shim_q,
+                    pinned_baseline=baseline_median, writable_paths=writable)
                 if err:
                     return True, None, err   # ran + correct, but metric underivable
                 return True, metric, None

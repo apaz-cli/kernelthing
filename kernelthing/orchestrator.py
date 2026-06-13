@@ -19,7 +19,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from . import bench, evolve, gates, opencode_client, prompts
+from . import bench, evolve, gates, gpulock, opencode_client, prompts
 from .bus import LoopBus
 from .config import Config, format_duration
 from .problem import Problem
@@ -175,6 +175,11 @@ class Orchestrator:
         self.impl_session: str | None = None   # reused only by the methodology turn
         self._history: list[dict] = []   # [{round: member_id, metric}] of viable members
         self._best: float | None = None
+        # Baseline reference time (us), measured once at run start and pinned as the
+        # fixed denominator for pct_baseline/speedup so every candidate shares one
+        # baseline (see _evolve_seed / bench.measure_baseline). None = not pinned;
+        # scoring then falls back to per-candidate baseline measurement.
+        self._baseline_us: float | None = None
         self._dispatched = 0   # candidates dispatched this run (for the methodology phase)
         self._logfile: Path | None = None  # full persistent narrative (set in setup)
         # Serializes git plumbing that touches shared repo state (worktree
@@ -227,12 +232,19 @@ class Orchestrator:
         infrastructure (state file, plan, plan backup, prompt/summary/contract
         files, git push). ``phase`` is one of impl/review/finalize/methodology.
         """
+        from .bootstrap import _protected_files
+        from .config import REPO_ROOT
+        root = Path(project_root or self.wd).resolve()
         return {
             "loopDir": str((loop_dir or dirs.base).resolve()),
-            "projectRoot": str(Path(project_root or self.wd).resolve()),
+            "projectRoot": str(root),
             "planFile": self.problem.plan,
             "currentRound": rnd,
             "phase": phase,
+            "gpuRun": str(REPO_ROOT / "kernelthing" / "gpu_run.sh"),
+            "editFiles": [str(Path(f)) for f in self.problem.edit_files],
+            "editDir": str(root / self.problem.rel_dir) if self.problem.rel_dir not in ("", ".") else str(root),
+            "protectedFiles": sorted(_protected_files(self.problem)),
         }
 
     def _score_cmd_str(self) -> str:
@@ -262,6 +274,19 @@ class Orchestrator:
         from .config import REPO_ROOT
         parts: list[str] = []
         pyexe = sys.executable or "python3"
+        gpu_run = str(REPO_ROOT / "kernelthing" / "gpu_run.sh")
+        if self.cfg.sandbox:
+            parts.append(
+                "### Shared GPU — serialize every GPU command\n\n"
+                "You share one physical GPU with other agents and the scorer. "
+                "Running on it concurrently corrupts timings and can OOM, so EVERY "
+                "command that executes on the device — your compiled benchmark, "
+                f"`ncu`, `nsys` — MUST be wrapped in `{gpu_run}`, which holds a "
+                "per-device lock for the command's duration:\n\n"
+                f"```bash\n{gpu_run} ./your_bench --args\n```\n\n"
+                "CPU-only commands (building with `nvcc`, querying KernelWiki, "
+                "parsing `.ncu-rep` files) do NOT need it. Profilers are enforced; "
+                "wrap your benchmark binaries too.")
         if self.cfg.wiki:
             parts.append(prompts.load_and_render_safe(
                 "claude/kernel-tools-wiki.md", "",
@@ -272,6 +297,7 @@ class Orchestrator:
             parts.append(prompts.load_and_render_safe(
                 "claude/kernel-tools-ncu.md", "",
                 PYTHON=pyexe,
+                GPU_RUN=gpu_run,
                 NCU_DIR=str(REPO_ROOT / "vendor" / "ncu-report-skill"),
                 NCU_BIN=shutil.which("ncu") or "/usr/local/cuda/bin/ncu",
                 NCU_PYTHONPATH=str(ncu_pp[-1]) if ncu_pp else ""))
@@ -330,7 +356,7 @@ class Orchestrator:
             prompt, working_dir=self.wd, model=self.cfg.model, session=self.impl_session,
             timeout=self.cfg.opencode_timeout, gpu_index=self.cfg.gpu_index,
             writable=True, sandboxed=self.cfg.sandbox, log_path=log_path, guard=guard,
-            ncu=self.cfg.ncu)
+            ncu=self.cfg.ncu, gpu_lock=gpulock.lock_path(self.cfg.gpu_index))
         if res.session_id:
             self.impl_session = res.session_id
         return res
@@ -346,7 +372,7 @@ class Orchestrator:
         problem's direction (robust to jitter).
         """
         if self.cfg.pygpubench:
-            return bench.score(self.problem, wt)
+            return bench.score(self.problem, wt, baseline_median=self._baseline_us)
         cwd = wt / self.problem.rel_dir
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(self.cfg.gpu_index))
         all_correct, metrics, err = True, [], None
@@ -368,21 +394,20 @@ class Orchestrator:
         best = max(metrics) if self.problem.direction == "maximize" else min(metrics)
         return all_correct, best, None
 
-    def _guarded_score(self, wt: Path, bench_sem: threading.Semaphore | None = None
-                       ) -> tuple[bool, float | None, str | None]:
+    def _guarded_score(self, wt: Path) -> tuple[bool, float | None, str | None]:
         """Run the cheap static cheat gate (kernelguard) BEFORE the expensive bench:
         a detected cheat is disqualified outright and never scored. The benchmark
-        runs under ``bench_sem`` when given (the GPU must stay exclusive)."""
+        itself runs under the per-device GPU lock (kernelthing/gpulock.py) so it
+        never overlaps another benchmark or an agent's own GPU work -- including
+        agents in other kernelthing processes on the same physical card."""
         if self.cfg.kernelguard:
             cheats = gates.kernelguard_violations(
                 self.problem.edit_files, wt, profile=self.cfg.kernelguard_profile,
                 metadata={"problem_name": self.problem.name})
             if cheats:
                 return False, None, "kernelguard: " + ", ".join(x["file"] for x in cheats)
-        if bench_sem is not None:
-            with bench_sem:
-                return self._score_worktree(wt)
-        return self._score_worktree(wt)
+        with gpulock.gpu_lock(self.cfg.gpu_index):
+            return self._score_worktree(wt)
 
     # --- async evolutionary search ---
     @staticmethod
@@ -414,12 +439,14 @@ class Orchestrator:
         return body + prompts.render(EVOLVE_DESCRIPTOR_FOOTER, **common) + common["KERNEL_TOOLS"]
 
     def _evolve_task(self, task: evolve.Task, base: str, wt_root: Path,
-                     dirs: LoopDirs, bench_sem: threading.Semaphore) -> evolve.Member:
+                     dirs: LoopDirs) -> evolve.Member:
         """Worker: fork a worktree, run one agent turn, then (serialized) score it.
 
         Pure git plumbing is taken under ``self._git_lock``; the agent turn and the
-        benchmark run outside it (the benchmark under ``bench_sem``, which keeps the
-        GPU exclusive). Returns the scored Member; never raises.
+        benchmark run outside it. GPU exclusivity is handled by the per-device
+        flock (kernelthing/gpulock.py): the agent holds it for its own GPU work via
+        the ``gpu-run`` wrapper, and ``_guarded_score`` holds it for the bench.
+        Returns the scored Member; never raises.
         """
         m = evolve.Member(id=task.member_id, operator=task.operator, parent_id=task.parent_id)
         parent_commit = task.parent_commit or base
@@ -439,7 +466,8 @@ class Orchestrator:
                 timeout=self.cfg.opencode_timeout, gpu_index=self.cfg.gpu_index,
                 writable=True, sandboxed=self.cfg.sandbox, log_path=log,
                 data_dir=wt / ".humanize" / "oc-data", extra_writable=[self.wd / ".git"],
-                guard=guard, ncu=self.cfg.ncu)
+                guard=guard, ncu=self.cfg.ncu,
+                gpu_lock=gpulock.lock_path(self.cfg.gpu_index))
             head = gates.git(["rev-parse", "HEAD"], wt).stdout.strip()
             m.commit = head if head and head != parent_commit else None
             sm = wt / "candidate-summary.md"
@@ -453,7 +481,7 @@ class Orchestrator:
             # score the COMMITTED state: restore edit files from HEAD, gate, bench
             with self._git_lock:
                 gates.git(["checkout", "--", *self.problem.edit_files], wt)
-            m.correct, m.metric, m.error = self._guarded_score(wt, bench_sem)
+            m.correct, m.metric, m.error = self._guarded_score(wt)
         except Exception as e:  # noqa: BLE001  -- a crashed worker must not kill the loop
             m.error = repr(e)
         finally:
@@ -472,7 +500,20 @@ class Orchestrator:
         with self._git_lock:
             gates.git(["worktree", "add", "--detach", "--force", str(wt), base], self.wd)
         try:
-            m.correct, m.metric, m.error = self._score_worktree(wt)
+            with gpulock.gpu_lock(self.cfg.gpu_index):
+                # Pin the baseline ONCE here so every candidate (and the seed
+                # itself) is scored against one fixed denominator -- the baseline
+                # is then exactly 100%. Falls back to per-candidate measurement if
+                # it fails or the problem has no baseline (measure_baseline -> None).
+                if self.cfg.pygpubench:
+                    self._baseline_us, berr = bench.measure_baseline(self.problem, wt)
+                    if berr:
+                        self._log(f"baseline pin failed ({berr}); "
+                                  "falling back to per-candidate baseline")
+                    elif self._baseline_us is not None:
+                        self._log(f"baseline pinned: {self._baseline_us:.1f}us "
+                                  "(= 100%, fixed for the run)")
+                m.correct, m.metric, m.error = self._score_worktree(wt)
         finally:
             with self._git_lock:
                 gates.git(["worktree", "remove", "--force", str(wt)], self.wd)
@@ -497,10 +538,12 @@ class Orchestrator:
         """Steady-state asynchronous evolutionary search (see kernelthing/evolve.py).
 
         Keeps up to ``-j``/parallelism agents editing at once (live-tunable down via
-        the web UI); benchmarking is serialized by ``bench_sem`` because the GPU must
-        stay exclusive. Dispatches explore/exploit/salvage tasks against a durable
-        population until the candidate / wall-clock budget is spent or a stop is
-        requested, then promotes the single best-scoring kernel to HEAD.
+        the web UI); all GPU work (each agent's build/run/profile via ``gpu-run``
+        and the authoritative benchmark) is serialized by the per-device flock
+        (kernelthing/gpulock.py), so the device is never shared. Dispatches
+        explore/exploit/salvage tasks against a durable population until the
+        candidate / wall-clock budget is spent or a stop is requested, then
+        promotes the single best-scoring kernel to HEAD.
         """
         state, dirs = self.setup()
         cfg = self.cfg
@@ -511,7 +554,6 @@ class Orchestrator:
         wt_root = cfg.problem_root / "wt" / state.timestamp / "evolve"
         shutil.rmtree(wt_root, ignore_errors=True)
         wt_root.mkdir(parents=True, exist_ok=True)
-        bench_sem = threading.Semaphore(max(1, cfg.bench_concurrency))
         search_start: float | None = None   # set after the seed benchmark (see below)
 
         def wall_limit() -> int:
@@ -596,7 +638,7 @@ class Orchestrator:
             task = evolve.Task(member_id=mid, operator=op,
                                parent_id=(parent.id if parent else None),
                                parent_commit=(parent.commit if parent else None), prompt=prompt)
-            fut = ex.submit(self._evolve_task, task, base, wt_root, dirs, bench_sem)
+            fut = ex.submit(self._evolve_task, task, base, wt_root, dirs)
             futures[fut] = task
             if parent is not None:
                 in_flight[parent.id] = in_flight.get(parent.id, 0) + 1

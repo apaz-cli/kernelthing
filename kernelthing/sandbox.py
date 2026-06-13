@@ -42,6 +42,7 @@ def wrap(
     writable_extra: list[Path] | tuple[Path, ...] = (),
     enabled: bool = True,
     ncu: bool = True,
+    gpu_lock: Path | None = None,
 ) -> list[str]:
     """Return ``inner_argv`` wrapped in a bwrap invocation (or unchanged if disabled).
 
@@ -50,6 +51,10 @@ def wrap(
     real locations -- used for opencode's own session/cache state so the
     implementer's ``-s`` session persists across rounds. ``ncu``: also bind the
     GPU performance-counter capability nodes so Nsight Compute can profile.
+    ``gpu_lock``: bind this lockfile read-write at its real path so the agent's
+    ``gpu-run`` wrapper shares the same inode -- and therefore the same flock --
+    as the orchestrator's benchmark (the lock lives under /tmp, which the sandbox
+    otherwise masks with a fresh tmpfs; the explicit bind reaches through it).
     """
     if not enabled:
         return inner_argv
@@ -79,6 +84,11 @@ def wrap(
     for node in nodes:
         if Path(node).exists():
             args += ["--dev-bind", node, node]
+
+    # GPU mutex lockfile: bound after --tmpfs /tmp so it reaches through the mask
+    # (same inode as the host => flock coordinates across the sandbox boundary).
+    if gpu_lock is not None and Path(gpu_lock).exists():
+        args += ["--bind", str(gpu_lock), str(gpu_lock)]
 
     # Run inside the project worktree.
     args += ["--chdir", str(project_dir)]

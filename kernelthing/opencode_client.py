@@ -90,6 +90,7 @@ def run_interactive(
     data_dir: Path | None = None,
     extra_writable: list[Path] | tuple[Path, ...] = (),
     ncu: bool = True,
+    gpu_lock: Path | None = None,
 ) -> int:
     """Launch opencode's interactive TUI attached to the terminal, return exit code.
 
@@ -115,6 +116,10 @@ def run_interactive(
 
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+    if gpu_lock is not None:
+        env["KERNELTHING_GPU_LOCK"] = str(gpu_lock)
+    # Disable opencode's snapshot feature (see ``run`` for why it is so costly here).
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"snapshot": False})
     if data_dir is not None:
         data_dir = Path(data_dir)
         oc_state = [data_dir / "share", data_dir / "state", data_dir / "cache"]
@@ -131,6 +136,7 @@ def run_interactive(
         writable_extra=[*oc_state, *extra_writable],
         enabled=sandboxed and sandbox.available(),
         ncu=ncu,
+        gpu_lock=gpu_lock,
     )
     # Inherit the tty (stdin/stdout/stderr = None) so the user interacts directly.
     return subprocess.run(argv, env=env).returncode
@@ -151,6 +157,7 @@ def run(
     extra_writable: list[Path] | tuple[Path, ...] = (),
     guard: dict | None = None,
     ncu: bool = True,
+    gpu_lock: Path | None = None,
 ) -> OpencodeResult:
     """Run one opencode turn and return the parsed result.
 
@@ -187,12 +194,24 @@ def run(
 
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+    if gpu_lock is not None:
+        env["KERNELTHING_GPU_LOCK"] = str(gpu_lock)
 
+    # Force opencode's snapshot/checkpoint feature OFF. It git-adds the ENTIRE
+    # working dir on every edit into a repo under .humanize/oc-data -- which lives
+    # *inside* the worktree, so it recursively snapshots its own growing store plus
+    # the multi-MB _build/_build_ref artifacts. That pegs a CPU and dominates wall
+    # time. kernelthing manages its own git commits and discards the worktree, so the
+    # snapshots are pure overhead. The repo's opencode.json (snapshot:false) can't
+    # reach the agent -- it runs in the per-worktree problem repo and we override
+    # config via OPENCODE_CONFIG_CONTENT here -- so set it inline.
+    oc_config: dict = {"snapshot": False}
     if guard is not None:
         guard_cfg = dict(guard)
         guard_cfg.setdefault("blockDir", str(_GUARD_BLOCK_DIR))
         env["KERNELTHING_GUARD"] = json.dumps(guard_cfg)
-        env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"plugin": [str(_GUARD_PLUGIN)]})
+        oc_config["plugin"] = [str(_GUARD_PLUGIN)]
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(oc_config)
 
     if data_dir is not None:
         data_dir = Path(data_dir)
@@ -210,6 +229,7 @@ def run(
         writable_extra=[*oc_state, *extra_writable],
         enabled=sandboxed and sandbox.available(),
         ncu=ncu,
+        gpu_lock=gpu_lock,
     )
 
     import tempfile
