@@ -101,6 +101,8 @@ def prepare_problem(problem: Problem, managed_root: Path) -> Problem:
         else:
             shutil.copy2(item, dest / item.name)
 
+    _rewrite_plan_for_worktree(dest, problem)
+
     subprocess.run(["git", "init", "-b", "main"], cwd=dest, check=True,
                    capture_output=True)
     subprocess.run(["git", "add", "-A"], cwd=dest, check=True, capture_output=True)
@@ -108,3 +110,32 @@ def prepare_problem(problem: Problem, managed_root: Path) -> Problem:
                    cwd=dest, check=True, capture_output=True)
 
     return load_problem(dest / "problem.json")
+
+
+def _rewrite_plan_for_worktree(dest: Path, problem: Problem) -> None:
+    """Update the copied plan.md for standalone worktree context.
+
+    The source plan references the kernelthing repo layout (e.g. ``kernelthing
+    score problems/<name>``).  In the managed worktree the problem files live at
+    the repo root, not under ``problems/<name>/``, so these references are wrong.
+    Replace them with the worktree-appropriate equivalent and prepend a context
+    notice so agents know where they are.
+    """
+    import sys
+    plan_path = dest / problem.plan
+    if not plan_path.is_file():
+        return
+    text = plan_path.read_text(encoding="utf-8")
+    original = text
+
+    source_dir = f"problems/{problem.name}"
+    if source_dir in text:
+        text = text.replace(source_dir, ".")
+        text = text.replace("./plan.md", "plan.md")
+
+    venv_bin = Path(sys.executable).parent
+    kt = str(venv_bin / "kernelthing")
+    text = text.replace("kernelthing score", f"{kt} score")
+
+    if text != original:
+        plan_path.write_text(text, encoding="utf-8")

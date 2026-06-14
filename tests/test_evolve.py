@@ -5,42 +5,12 @@ from kernelthing import evolve
 from kernelthing.evolve import Member, Population
 
 
-def _viable(pop, *, metric, strategy="s", wall=evolve.WALL_UNKNOWN, ceiling=None):
-    m = Member(id=pop.next_id(), operator=evolve.OP_EXPLORE, commit=f"c{metric}",
-               metric=metric, correct=True, strategy=strategy, wall=wall, ceiling=ceiling)
+def _viable(pop, *, metric, message="", commit="c"):
+    m = Member(id=pop.next_id(), operator=evolve.OP_EXPLORE,
+               commit=commit or f"c{metric}", commit_message=message,
+               metric=metric, correct=True)
     pop.insert(m)
     return m
-
-
-# --- descriptor parsing ---
-
-def test_parse_descriptor_full():
-    text = (
-        "## Strategy Descriptor\n"
-        "Strategy: 128x128 Tiling + cp.async\n"
-        "Wall: fixable\n"
-        "Ceiling: 92.5 %cuBLAS\n"
-        "Next: double-buffer the smem stage\n"
-    )
-    d = evolve.parse_descriptor(text)
-    assert d.strategy == "128x128 tiling + cp.async"   # lowercased, whitespace-collapsed
-    assert d.wall == evolve.WALL_FIXABLE
-    assert d.ceiling == 92.5
-    assert d.next_lever == "double-buffer the smem stage"
-
-
-def test_parse_descriptor_missing_fields_defaults():
-    d = evolve.parse_descriptor("no descriptor here")
-    assert d.strategy == "uncategorized"
-    assert d.wall == evolve.WALL_UNKNOWN
-    assert d.ceiling is None
-    assert d.next_lever == ""
-
-
-def test_parse_descriptor_bad_ceiling_is_none():
-    d = evolve.parse_descriptor("Strategy: x\nCeiling: lots\n")
-    assert d.strategy == "x"
-    assert d.ceiling is None
 
 
 # --- viability + frontier ---
@@ -87,36 +57,23 @@ def test_status_classification():
     assert live.status == evolve.ST_LIVE
 
 
-# --- niches (MAP-Elites) ---
+# --- niches (commit-message derived) ---
 
-def test_niches_keep_best_per_strategy():
+def test_niches_keep_best_per_message():
     pop = Population()
-    _viable(pop, metric=10, strategy="a")
-    best_a = _viable(pop, metric=40, strategy="a")
-    b = _viable(pop, metric=20, strategy="b")
+    _viable(pop, metric=10, message="add tiling")
+    best_a = _viable(pop, metric=40, message="add tiling")
+    b = _viable(pop, metric=20, message="fuse layernorm")
     grid = pop.niches()
-    assert set(grid) == {"a", "b"}
-    assert grid["a"] is best_a
-    assert grid["b"] is b
+    assert set(grid) == {"add tiling", "fuse layernorm"}
+    assert grid["add tiling"] is best_a
+    assert grid["fuse layernorm"] is b
 
 
-# --- salvage pool ---
-
-def test_salvageable_prefers_fixable_non_elites():
-    pop = Population(elite_k=1)
-    _viable(pop, metric=100, strategy="top")           # elite
-    fix = _viable(pop, metric=40, wall=evolve.WALL_FIXABLE)
-    _viable(pop, metric=30, wall=evolve.WALL_FUNDAMENTAL)
-    pool = pop.salvageable()
-    assert fix in pool
-    assert all(m.wall == evolve.WALL_FIXABLE for m in pool)
-
-
-def test_salvageable_falls_back_to_any_non_elite():
-    pop = Population(elite_k=1)
-    _viable(pop, metric=100)                            # elite
-    other = _viable(pop, metric=40, wall=evolve.WALL_UNKNOWN)
-    assert other in pop.salvageable()
+def test_niche_key_from_commit_message():
+    pop = Population()
+    m = _viable(pop, metric=10, message="  perf:  Precompute  PRNG  into shared  memory (3.95x)  ")
+    assert m.niche_key() == "perf: precompute prng into shared memory (3.95x)"
 
 
 # --- operator selection ---
@@ -124,33 +81,59 @@ def test_salvageable_falls_back_to_any_non_elite():
 def test_choose_operator_forces_explore_without_elites():
     rng = random.Random(0)
     op = evolve.choose_operator(rng, {evolve.OP_EXPLOIT: 1.0},
-                                have_elites=False, n_salvage=0, n_niches=0, min_niches=4)
+                                have_elites=False, n_niches=0, min_niches=4)
     assert op == evolve.OP_EXPLORE
-
-
-def test_choose_operator_zeroes_salvage_when_none():
-    rng = random.Random(0)
-    weights = {evolve.OP_EXPLORE: 0.0, evolve.OP_EXPLOIT: 1.0, evolve.OP_SALVAGE: 5.0}
-    seen = {evolve.choose_operator(
-        rng, weights, have_elites=True, n_salvage=0, n_niches=10, min_niches=4)
-        for _ in range(50)}
-    assert evolve.OP_SALVAGE not in seen
 
 
 def test_choose_operator_respects_weights():
     rng = random.Random(1)
     ops = [evolve.choose_operator(
-        rng, {evolve.OP_EXPLORE: 0.0, evolve.OP_EXPLOIT: 1.0, evolve.OP_SALVAGE: 0.0},
-        have_elites=True, n_salvage=1, n_niches=10, min_niches=4) for _ in range(20)]
-    assert set(ops) == {evolve.OP_EXPLOIT}
+        rng, {evolve.OP_EXPLORE: 1.0, evolve.OP_EXPLOIT: 0.0},
+        have_elites=True, n_niches=10, min_niches=4) for _ in range(20)]
+    assert set(ops) == {evolve.OP_EXPLORE}
+
+
+def test_choose_operator_double_explore_when_underpopulated():
+    rng = random.Random(0)
+    # With equal weights but 0 niches (under min_niches=4), explore is doubled
+    seen = set()
+    for _ in range(100):
+        seen.add(evolve.choose_operator(
+            rng, {evolve.OP_EXPLORE: 0.5, evolve.OP_EXPLOIT: 0.5},
+            have_elites=True, n_niches=0, min_niches=4))
+    # Both operators are possible but explore should dominate (2:1 odds)
+    assert "explore" in seen
 
 
 # --- parent selection / bandit ---
 
-def test_select_parent_explore_is_none():
+def test_select_parent_explore_returns_viable_member():
     pop = Population()
-    _viable(pop, metric=10)
+    a = _viable(pop, metric=10)
+    b = _viable(pop, metric=30)
+    # explore selects from all viable members, biased toward unvisited
+    p = pop.select_parent(evolve.OP_EXPLORE, random.Random(0), {})
+    assert p is not None
+    assert p.id in {a.id, b.id}
+
+
+def test_select_parent_explore_empty_pool_returns_none():
+    pop = Population()
     assert pop.select_parent(evolve.OP_EXPLORE, random.Random(0), {}) is None
+
+
+def test_select_parent_explore_favors_unvisited():
+    pop = Population()
+    a = _viable(pop, metric=10, message="a")
+    b = _viable(pop, metric=30, message="b")
+    a.children = 10   # heavily visited
+    b.children = 0    # untouched
+    # b should be picked far more often
+    rng = random.Random(42)
+    counts = {a.id: 0, b.id: 0}
+    for _ in range(200):
+        counts[pop.select_parent(evolve.OP_EXPLORE, rng, {}).id] += 1
+    assert counts[b.id] > counts[a.id]
 
 
 def test_select_parent_exploit_returns_an_elite():
@@ -167,8 +150,8 @@ def test_virtual_loss_discourages_busy_arm():
     # Two equal-metric elites; the one with many in-flight children should be
     # chosen far less often (virtual loss divides its weight).
     pop = Population(elite_k=2)
-    a = _viable(pop, metric=50, strategy="a")
-    b = _viable(pop, metric=50, strategy="b")
+    a = _viable(pop, metric=50, message="a")
+    b = _viable(pop, metric=50, message="b")
     in_flight = {a.id: 8}
     counts = {a.id: 0, b.id: 0}
     rng = random.Random(0)

@@ -70,10 +70,9 @@ class Config:
     # not in-process state, so agents and the bench never share the card -- even
     # across separate kernelthing processes on the same physical GPU.
     evolve_seed: int = 0          # RNG seed for operator/parent sampling
-    op_explore: float = 0.4       # base operator-selection weights
-    op_exploit: float = 0.4
-    op_salvage: float = 0.2
-    opencode_timeout: int = 5400
+    op_explore: float = 0.5       # base operator-selection weights
+    op_exploit: float = 0.5
+    opencode_timeout: int = 1200
     gpu_index: int = 0
     bitlesson_required: bool = True
     methodology: bool = False

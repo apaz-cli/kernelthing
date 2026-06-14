@@ -12,10 +12,13 @@ import time
 
 
 class LoopBus:
-    def __init__(self, parallelism: int, wall_clock_s: int = 0):
+    def __init__(self, parallelism: int, wall_clock_s: int = 0, max_candidates: int = 0):
         self._lock = threading.Lock()
         self._parallelism = max(1, int(parallelism))
         self._wall_clock_s = max(0, int(wall_clock_s))
+        self._max_candidates = max(0, int(max_candidates))
+        self._explore_bias = 50     # 0-100: 0=all exploit, 100=all explore
+        self._explore_auto = True   # when True, the orchestrator applies a schedule
         self._stop = False
         self._status: dict = {}
         self._log: list[str] = []
@@ -35,6 +38,21 @@ class LoopBus:
         with self._lock:
             return self._wall_clock_s
 
+    def max_candidates(self) -> int:
+        """Live candidate budget (0 = unlimited). Tunable from the UI."""
+        with self._lock:
+            return self._max_candidates
+
+    def explore_bias(self) -> int:
+        """0-100: 0 = all exploit, 100 = all explore."""
+        with self._lock:
+            return self._explore_bias
+
+    def explore_auto(self) -> bool:
+        """Whether the auto-schedule is active."""
+        with self._lock:
+            return self._explore_auto
+
     # --- control: written by the UI ---
     def set_parallelism(self, n: int) -> None:
         with self._lock:
@@ -43,6 +61,22 @@ class LoopBus:
     def set_wall_clock(self, seconds: int) -> None:
         with self._lock:
             self._wall_clock_s = max(0, int(seconds))
+
+    def set_max_candidates(self, n: int) -> None:
+        """Set live candidate budget (0 = unlimited)."""
+        with self._lock:
+            self._max_candidates = max(0, int(n))
+
+    def set_explore_bias(self, bias: int) -> None:
+        """Set manual explore bias (0-100). Disables auto-schedule."""
+        with self._lock:
+            self._explore_bias = max(0, min(100, int(bias or 50)))
+            self._explore_auto = False
+
+    def set_explore_auto(self) -> None:
+        """Re-enable the auto-schedule."""
+        with self._lock:
+            self._explore_auto = True
 
     def request_stop(self) -> None:
         with self._lock:
@@ -74,7 +108,10 @@ class LoopBus:
             snap["control"] = {
                 "parallelism": self._parallelism,
                 "wall_clock_s": self._wall_clock_s,
+                "max_candidates": self._max_candidates,
                 "stop": self._stop,
+                "explore_bias": self._explore_bias,
+                "explore_auto": self._explore_auto,
             }
             snap["log"] = list(self._log[-120:])
             return snap

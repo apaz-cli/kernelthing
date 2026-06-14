@@ -38,6 +38,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -207,7 +208,7 @@ class _GeneratorAdapter:
     def __call__(self, **kwargs):
         import torch
         inputs, expected = self._gen(**kwargs)
-        output = torch.empty_like(expected[0])
+        output = expected[0].new_empty(expected[0].size())
         return (output,) + tuple(inputs), expected
 
 
@@ -341,6 +342,34 @@ def measure_baseline(problem, worktree: Path) -> tuple[float | None, str | None]
                 _cleanup_shim(base_shim_path)
     except Exception as e:  # noqa: BLE001
         return None, _explain_bench_error(e)
+
+
+def warm_build(problem, worktree: Path, *, timeout: int = 60) -> None:
+    """Trigger compilation of the worktree's kernel in a subprocess outside the GPU
+    lock, so the real benchmark only pays runtime, not compile time.
+
+    Runs ``python -c 'import submission'`` inside the problem dir with
+    ``CUDA_VISIBLE_DEVICES=""`` — enough to force ``torch.utils.cpp_extension.load``
+    to compile and cache the ``.so``, but the import itself will fail when the
+    kernel launch is actually attempted (no GPU visible). That is fine: the build
+    artifacts survive and the real pygpubench benchmark reuses them.
+
+    Best-effort: if the subprocess fails or times out the caller proceeds anyway
+    and the real benchmark just compiles in-line.
+    """
+    prob_dir = Path(worktree) / problem.rel_dir
+    if not prob_dir.is_dir():
+        return
+    try:
+        subprocess.run(
+            [sys.executable, "-c", "import submission"],
+            cwd=str(prob_dir),
+            capture_output=True,
+            timeout=timeout,
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+        )
+    except Exception:
+        pass   # best-effort
 
 
 def score(problem, worktree: Path, *,

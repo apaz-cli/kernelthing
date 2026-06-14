@@ -12,16 +12,14 @@ the side-effecting orchestration (worktrees, agents, git) lives in
 orchestrator.py.
 
 Operators -- one per dispatched task:
-  * ``explore``  -- fork the base, take a strategy not yet in the archive (breadth)
-  * ``exploit``  -- refine a top-scoring elite along the same approach (depth)
-  * ``salvage``  -- re-target a viable-but-stalled near-miss the agent judged
-    one *fixable* step short of a higher ceiling
+  * ``explore`` -- fork the base, take a strategy not yet in the archive (breadth)
+  * ``exploit`` -- refine a top-scoring elite along the same approach (depth)
 
-Selection keeps a top-K elite set plus a per-strategy niche map (MAP-Elites), so
-the search cannot collapse onto one lineage. Compute is steered toward lineages
-with the best metric and recent headroom via a UCB-style bandit whose visit count
-includes in-flight children (virtual loss), so concurrent dispatch does not pile
-onto a single arm before its results land.
+Selection keeps a top-K elite set plus a per-niche map for diversity, keyed on
+the commit message (first 60 chars, lowercased).  Compute is steered toward
+lineages with the best metric via a UCB-style bandit whose visit count includes
+in-flight children (virtual loss), so concurrent dispatch does not pile onto a
+single arm before its results land.
 """
 from __future__ import annotations
 
@@ -33,17 +31,11 @@ from dataclasses import dataclass
 # operators
 OP_EXPLORE = "explore"
 OP_EXPLOIT = "exploit"
-OP_SALVAGE = "salvage"
 
 # member status (for display / classification)
 ST_ELITE = "elite"    # viable and on the top-K frontier
-ST_LIVE = "live"      # viable, retained, parent-able (salvage pool)
+ST_LIVE = "live"      # viable, retained, parent-able
 ST_DEAD = "dead"      # not viable (incorrect / no commit / no metric)
-
-# agent triage of an approach's headroom
-WALL_FIXABLE = "fixable"
-WALL_FUNDAMENTAL = "fundamental"
-WALL_UNKNOWN = "unknown"
 
 
 @dataclass
@@ -54,20 +46,23 @@ class Member:
     operator: str
     parent_id: int | None = None
     commit: str | None = None
+    commit_message: str = ""       # first line of the git commit (human-readable, used for niche key)
     metric: float | None = None
     correct: bool = False
-    strategy: str = "uncategorized"   # niche descriptor (agent-reported)
-    wall: str = WALL_UNKNOWN          # fixable | fundamental | unknown
-    ceiling: float | None = None      # agent's estimated ceiling for this approach
-    next_lever: str = ""              # the agent's noted next step
-    summary_text: str = ""
+    summary_text: str = ""         # raw candidate-summary.md (for human debugging)
     error: str | None = None
-    children: int = 0                 # tasks dispatched from this member (bandit visits)
+    children: int = 0              # tasks dispatched from this member (bandit visits)
     status: str = ST_DEAD
 
     @property
     def viable(self) -> bool:
         return self.correct and self.commit is not None and self.metric is not None
+
+    def niche_key(self) -> str:
+        """A stable niche key derived from the commit message."""
+        if not self.commit_message:
+            return "uncategorized"
+        return re.sub(r"\s+", " ", self.commit_message.strip().lower())[:60]
 
 
 @dataclass
@@ -79,46 +74,6 @@ class Task:
     parent_id: int | None
     parent_commit: str | None    # None -> fork the base
     prompt: str
-
-
-@dataclass
-class Descriptor:
-    strategy: str = "uncategorized"
-    wall: str = WALL_UNKNOWN
-    ceiling: float | None = None
-    next_lever: str = ""
-
-
-_STRATEGY_RE = re.compile(r"^\s*Strategy:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
-_WALL_RE = re.compile(r"^\s*Wall:\s*(fixable|fundamental)\s*$", re.IGNORECASE | re.MULTILINE)
-_CEILING_RE = re.compile(r"^\s*Ceiling:\s*([-+]?[0-9]*\.?[0-9]+)", re.IGNORECASE | re.MULTILINE)
-_NEXT_RE = re.compile(r"^\s*Next:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
-
-
-def parse_descriptor(summary_text: str) -> Descriptor:
-    """Extract the ``## Strategy Descriptor`` fields from a candidate summary.
-
-    Tolerant: any field may be missing. ``strategy`` is lowercased and clamped so
-    it forms a stable niche key; ``ceiling`` is parsed as a float when present.
-    """
-    d = Descriptor()
-    m = _STRATEGY_RE.search(summary_text)
-    if m:
-        label = re.sub(r"\s+", " ", m.group(1).strip().lower())
-        d.strategy = label[:60] or "uncategorized"
-    m = _WALL_RE.search(summary_text)
-    if m:
-        d.wall = m.group(1).lower()
-    m = _CEILING_RE.search(summary_text)
-    if m:
-        try:
-            d.ceiling = float(m.group(1))
-        except ValueError:
-            d.ceiling = None
-    m = _NEXT_RE.search(summary_text)
-    if m:
-        d.next_lever = m.group(1).strip()
-    return d
 
 
 def _better(a: float, b: float, direction: str) -> bool:
@@ -140,11 +95,13 @@ def _norm(values: list[float], direction: str) -> list[float]:
 
 
 def _bandit_weights(pool: list[Member], direction: str, in_flight: dict[int, int],
-                    value_fn, c: float) -> dict[int, float]:
-    """UCB-style weight per member: exploitation (normalized value) + exploration
+                    c: float) -> dict[int, float]:
+    """UCB-style weight per member: exploitation (normalized metric) + exploration
     (``c * sqrt(ln(total_visits+1)/(visits+1))``), divided by ``1 + in_flight`` so
     concurrent dispatch spreads across arms (virtual loss)."""
-    vals = [float(value_fn(m)) for m in pool]
+    vals = [float(m.metric) for m in pool if m.metric is not None]
+    if not vals:
+        return {m.id: 1e-9 for m in pool}
     norms = _norm(vals, direction)
     total = sum(m.children for m in pool)
     weights: dict[int, float] = {}
@@ -201,19 +158,11 @@ class Population:
         return s[0] if s else None
 
     def niches(self) -> dict[str, Member]:
-        """Best viable member per strategy label (MAP-Elites grid)."""
+        """Best viable member per niche key (commit-message derived)."""
         grid: dict[str, Member] = {}
         for m in self._viable_sorted():   # best-first, so first seen per key wins
-            grid.setdefault(m.strategy, m)
+            grid.setdefault(m.niche_key(), m)
         return grid
-
-    def salvageable(self) -> list[Member]:
-        """Viable non-elite members worth rescuing: those the agent judged
-        ``fixable`` (fallback: any viable non-elite)."""
-        elite_ids = {m.id for m in self.elites()}
-        pool = [m for m in self.members if m.viable and m.id not in elite_ids]
-        fixable = [m for m in pool if m.wall == WALL_FIXABLE]
-        return fixable or pool
 
     def _classify(self) -> None:
         for m in self.members:
@@ -226,34 +175,37 @@ class Population:
                       in_flight: dict[int, int]) -> Member | None:
         if operator == OP_EXPLOIT:
             pool = self.elites()
-            value_fn = lambda m: m.metric  # noqa: E731
-        elif operator == OP_SALVAGE:
-            pool = self.salvageable()
-            # prefer high estimated ceiling when given, else the measured metric
-            value_fn = lambda m: (m.ceiling if m.ceiling is not None else m.metric)  # noqa: E731
+        elif operator == OP_EXPLORE:
+            pool = self._viable_sorted()
         else:
-            return None   # explore forks the base
+            return None
         if not pool:
             return None
-        weights = _bandit_weights(pool, self.direction, in_flight, value_fn, self.ucb_c)
+        if operator == OP_EXPLORE:
+            # Pure exploration term: favour members with few children (neglected
+            # branches) so explore fans out across the frontier rather than always
+            # restarting from the baseline.
+            total = sum(m.children for m in pool)
+            weights: dict[int, float] = {}
+            for m in pool:
+                w = math.sqrt(math.log(total + 1) / (m.children + 1))
+                weights[m.id] = max(w / (1 + in_flight.get(m.id, 0)), 1e-9)
+            return _weighted_pick(pool, weights, rng)
+        weights = _bandit_weights(pool, self.direction, in_flight, self.ucb_c)
         return _weighted_pick(pool, weights, rng)
 
 
 def choose_operator(rng: random.Random, weights: dict[str, float], *,
-                    have_elites: bool, n_salvage: int, n_niches: int,
+                    have_elites: bool, n_niches: int,
                     min_niches: int) -> str:
-    """Pick an operator. Forces ``explore`` until a viable elite exists; zeroes
-    ``salvage`` when nothing is salvageable; and doubles the ``explore`` weight
-    while the niche grid is under-populated (keep breadth up early)."""
+    """Pick an operator. Forces ``explore`` until a viable elite exists and doubles
+    the ``explore`` weight while the niche grid is under-populated."""
     if not have_elites:
         return OP_EXPLORE
     w = {
         OP_EXPLORE: max(0.0, weights[OP_EXPLORE]),
         OP_EXPLOIT: max(0.0, weights[OP_EXPLOIT]),
-        OP_SALVAGE: max(0.0, weights[OP_SALVAGE]),
     }
-    if n_salvage == 0:
-        w[OP_SALVAGE] = 0.0
     if n_niches < min_niches:
         w[OP_EXPLORE] *= 2.0
     total = sum(w.values())

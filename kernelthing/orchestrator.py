@@ -104,8 +104,10 @@ EVOLVE_EXPLORE_PROMPT = """Your work is not finished. Read and execute the below
 @{{PLAN}}
 
 You are an **EXPLORE** candidate in an evolutionary kernel search: open a NEW line
-of attack from the baseline. Make ONE focused, correct improvement by editing ONLY
-{{EDIT_FILES}}, using an optimization strategy DISTINCT from those already tried:
+of attack. The working tree is at a kernel that reaches {{PARENT_METRIC}}{{UNIT}}
+(commit: {{PARENT_COMMIT_MESSAGE}}). Make ONE focused, correct improvement by
+editing ONLY {{EDIT_FILES}}, using an optimization strategy DISTINCT from those
+already tried:
 {{KNOWN_STRATEGIES}}
 Pick a genuinely different angle -- do not just retune one of the above.
 """
@@ -115,26 +117,14 @@ EVOLVE_EXPLOIT_PROMPT = """Your work is not finished. Read and execute the below
 ## Plan
 @{{PLAN}}
 
-You are an **EXPLOIT** candidate: deepen the current best kernel. The working tree
-is ALREADY at that kernel, which reaches {{PARENT_METRIC}}{{UNIT}} via strategy
-"{{PARENT_STRATEGY}}". Push it further along the SAME approach by editing ONLY
-{{EDIT_FILES}}. The previous author's noted next lever:
-  {{PARENT_NEXT}}
-Make ONE focused, correct, measured improvement on top of it -- keep correctness.
-"""
+You are an **EXPLOIT** candidate: deepen a current best kernel. The working tree
+is ALREADY at that kernel, which reaches {{PARENT_METRIC}}{{UNIT}}. The parent
+commit message was:
 
-EVOLVE_SALVAGE_PROMPT = """Your work is not finished. Read and execute the below with ultrathink.
+  {{PARENT_COMMIT_MESSAGE}}
 
-## Plan
-@{{PLAN}}
-
-You are a **SALVAGE** candidate: rescue a promising-but-stalled kernel. The working
-tree is ALREADY at it; it reaches {{PARENT_METRIC}}{{UNIT}} via strategy
-"{{PARENT_STRATEGY}}" and was judged ONE FIXABLE step short of a higher ceiling
-(~{{PARENT_CEILING}}{{UNIT}}). Fix that specific blocker by editing ONLY
-{{EDIT_FILES}}:
-  {{PARENT_NEXT}}
-Make ONE focused, correct, measured improvement that realizes the ceiling.
+Push it further along the SAME approach by editing ONLY {{EDIT_FILES}}. Make ONE
+focused, correct, measured improvement on top of it -- keep correctness.
 """
 
 EVOLVE_DESCRIPTOR_FOOTER = """
@@ -142,20 +132,19 @@ EVOLVE_DESCRIPTOR_FOOTER = """
 ---
 
 ## How to finish (REQUIRED)
-Self-test by running the scorer; it must report `"correct": true`. **Commit as soon
-as you have ANY correct improvement** (`git add -A && git commit -m "..."`) -- your
+Self-test by running the scorer:
+
+    {{GPU_RUN}} {{SCORE_CMD}}
+
+It must report `"correct": true`. **Commit as soon as
+you have ANY correct improvement** (`git add -A && git commit -m "..."`) -- your
 last committed correct version is what gets scored, so a timeout never wastes the
 run. You may then attempt a bigger gain, keeping the first as a fallback. Do NOT
 edit anything outside {{EDIT_FILES}}.
 
-Write @candidate-summary.md with the measured metric ({{UNIT}}), a `## BitLesson
-Delta` section (Action: none|add|update, Lesson ID(s):, Notes:), and a
-`## Strategy Descriptor` block of exactly these four lines so the search can place
-and score your approach:
-  Strategy: <=6-word label of the approach (e.g. "128x128 tiling + cp.async double-buffer")
-  Wall: fixable | fundamental   (is this one fixable step short, or fundamentally capped?)
-  Ceiling: <honest best-case metric this approach could reach, in {{UNIT}}>
-  Next: <the single most promising next lever if continued>
+Write @candidate-summary.md with a brief description of the changes made -- 2-3
+sentences or short bullet points, with the final measured metric ({{UNIT}}).
+Keep it under 1000 characters.
 """
 
 
@@ -248,17 +237,29 @@ class Orchestrator:
         }
 
     def _score_cmd_str(self) -> str:
-        if self.problem.rel_dir in ("", "."):
+        """Absolute-path scoring command the agent can self-test with.
+        
+        When pygpubench is on the problem's score_command is empty (the orchestrator
+        uses bench.score directly), but the agent still needs a working self-test
+        command. Construct one from the venv so the agent never has to discover
+        kernelthing on PATH.
+        """
+        from .config import REPO_ROOT
+        venv_bin = Path(sys.executable).parent
+        kt = str(venv_bin / "kernelthing")
+        if self.problem.score_command:
             return self.problem.score_command
-        return f"cd {self.problem.rel_dir} && {self.problem.score_command}"
+        return f"{kt} score ."
 
     def _prompt_common(self, state: State) -> dict:
         """Template fields shared by every operator prompt + the descriptor footer."""
+        from .config import REPO_ROOT
         return dict(
             PLAN=state.plan_file,
             PLAN_FILE=state.plan_file,
             EDIT_FILES=", ".join(self.problem.edit_files),
             SCORE_CMD=self._score_cmd_str(),
+            GPU_RUN=str(REPO_ROOT / "kernelthing" / "gpu_run.sh"),
             UNIT=self.problem.unit or self.problem.metric_name,
             BITLESSON_FILE=state.bitlesson_file,
             KERNEL_TOOLS=self._kernel_tools_block(),
@@ -284,6 +285,10 @@ class Orchestrator:
                 f"`ncu`, `nsys` — MUST be wrapped in `{gpu_run}`, which holds a "
                 "per-device lock for the command's duration:\n\n"
                 f"```bash\n{gpu_run} ./your_bench --args\n```\n\n"
+                "When another agent holds the lock, `gpu-run` will **block silently** "
+                "until released — this is normal queuing, not a hang. Do not run "
+                "`nvidia-smi` or `ps` to debug it; the command will proceed on its "
+                "own. Use the wait time to plan or read.\n\n"
                 "CPU-only commands (building with `nvcc`, querying KernelWiki, "
                 "parsing `.ncu-rep` files) do NOT need it. Profilers are enforced; "
                 "wrap your benchmark binaries too.")
@@ -396,10 +401,10 @@ class Orchestrator:
 
     def _guarded_score(self, wt: Path) -> tuple[bool, float | None, str | None]:
         """Run the cheap static cheat gate (kernelguard) BEFORE the expensive bench:
-        a detected cheat is disqualified outright and never scored. The benchmark
-        itself runs under the per-device GPU lock (kernelthing/gpulock.py) so it
-        never overlaps another benchmark or an agent's own GPU work -- including
-        agents in other kernelthing processes on the same physical card."""
+        a detected cheat is disqualified outright and never scored. The kernel is
+        pre-compiled outside the GPU lock so the benchmark only pays runtime."""
+        if self.cfg.pygpubench:
+            bench.warm_build(self.problem, wt)
         if self.cfg.kernelguard:
             cheats = gates.kernelguard_violations(
                 self.problem.edit_files, wt, profile=self.cfg.kernelguard_profile,
@@ -422,20 +427,16 @@ class Orchestrator:
         common = self._prompt_common(state)
         if operator == evolve.OP_EXPLORE:
             body = prompts.render(EVOLVE_EXPLORE_PROMPT,
+                                  PARENT_METRIC=self._fmt(parent.metric) if parent else "?",
+                                  PARENT_COMMIT_MESSAGE=(parent.commit_message if parent
+                                                         else "baseline"),
                                   KNOWN_STRATEGIES=known_strategies or "(none yet)", **common)
-        elif operator == evolve.OP_EXPLOIT:
+        else:  # exploit
             assert parent is not None
             body = prompts.render(EVOLVE_EXPLOIT_PROMPT,
                                   PARENT_METRIC=self._fmt(parent.metric),
-                                  PARENT_STRATEGY=parent.strategy,
-                                  PARENT_NEXT=parent.next_lever or "(none recorded)", **common)
-        else:  # salvage
-            assert parent is not None
-            body = prompts.render(EVOLVE_SALVAGE_PROMPT,
-                                  PARENT_METRIC=self._fmt(parent.metric),
-                                  PARENT_STRATEGY=parent.strategy,
-                                  PARENT_CEILING=self._fmt(parent.ceiling),
-                                  PARENT_NEXT=parent.next_lever or "(none recorded)", **common)
+                                  PARENT_COMMIT_MESSAGE=parent.commit_message or "(no commit message)",
+                                  **common)
         return body + prompts.render(EVOLVE_DESCRIPTOR_FOOTER, **common) + common["KERNEL_TOOLS"]
 
     def _evolve_task(self, task: evolve.Task, base: str, wt_root: Path,
@@ -470,11 +471,11 @@ class Orchestrator:
                 gpu_lock=gpulock.lock_path(self.cfg.gpu_index))
             head = gates.git(["rev-parse", "HEAD"], wt).stdout.strip()
             m.commit = head if head and head != parent_commit else None
+            if m.commit:
+                m.commit_message = gates.git(
+                    ["log", "-1", "--format=%s", "HEAD"], wt).stdout.strip()
             sm = wt / "candidate-summary.md"
             m.summary_text = sm.read_text(encoding="utf-8") if sm.exists() else ""
-            desc = evolve.parse_descriptor(m.summary_text)
-            m.strategy, m.wall, m.ceiling, m.next_lever = (
-                desc.strategy, desc.wall, desc.ceiling, desc.next_lever)
             if m.commit is None:
                 m.error = m.error or "no commit"
                 return m
@@ -495,7 +496,8 @@ class Orchestrator:
         If it scores, it is the first elite; if not, the population starts empty and
         every operator falls back to explore (forking the base) until one works.
         """
-        m = evolve.Member(id=pop.next_id(), operator="seed", commit=base, strategy="baseline")
+        m = evolve.Member(id=pop.next_id(), operator="seed", commit=base,
+                          commit_message="baseline")
         wt = wt_root / "seed"
         with self._git_lock:
             gates.git(["worktree", "add", "--detach", "--force", str(wt), base], self.wd)
@@ -522,16 +524,16 @@ class Orchestrator:
 
     def _evolve_members(self, pop: evolve.Population) -> list[dict]:
         """Full population snapshot for the UI -- drives the fitness chart, the
-        MAP-Elites niches, the lineage tree, and the leaderboard. Compact rows;
+        niches, the lineage tree, and the leaderboard. Compact rows;
         the in-flight agents are published separately (they are not yet members)."""
         best = pop.best()
         best_id = best.id if best else None
         return [{
             "id": m.id, "op": m.operator, "parent": m.parent_id,
-            "metric": m.metric, "correct": m.correct, "strategy": m.strategy,
+            "metric": m.metric, "correct": m.correct,
             "status": m.status, "commit": (m.commit or "")[:8],
-            "wall": m.wall, "ceiling": m.ceiling, "next": m.next_lever,
-            "error": m.error, "best": m.id == best_id,
+            "message": m.commit_message, "error": m.error,
+            "best": m.id == best_id,
         } for m in pop.members]
 
     def run(self) -> str:
@@ -541,7 +543,7 @@ class Orchestrator:
         the web UI); all GPU work (each agent's build/run/profile via ``gpu-run``
         and the authoritative benchmark) is serialized by the per-device flock
         (kernelthing/gpulock.py), so the device is never shared. Dispatches
-        explore/exploit/salvage tasks against a durable population until the
+        explore/exploit tasks against a durable population until the
         candidate / wall-clock budget is spent or a stop is requested, then
         promotes the single best-scoring kernel to HEAD.
         """
@@ -551,6 +553,7 @@ class Orchestrator:
         rng = random.Random(cfg.evolve_seed)
         pop = evolve.Population(direction=self.problem.direction, elite_k=cfg.elite_k)
         base = self._git(["rev-parse", "HEAD"])
+        self._base_commit = base
         wt_root = cfg.problem_root / "wt" / state.timestamp / "evolve"
         shutil.rmtree(wt_root, ignore_errors=True)
         wt_root.mkdir(parents=True, exist_ok=True)
@@ -590,6 +593,8 @@ class Orchestrator:
             self._publish(
                 mode="evolve", best=self._best, submitted=dispatched,
                 members=self._evolve_members(pop), clock=clock(True),
+                explore_bias=(self.bus.explore_bias() if self.bus else 50),
+                explore_auto=(self.bus.explore_auto() if self.bus else False),
                 agents=[{"id": t.member_id, "op": t.operator, "parent": t.parent_id,
                          "log_file": f"mem-{t.member_id}-{t.operator}-opencode.log"}
                         for t in futures.values()])
@@ -613,7 +618,8 @@ class Orchestrator:
         def want_more() -> bool:
             if self.bus and self.bus.stop_requested():
                 return False
-            if cfg.max_candidates and dispatched >= cfg.max_candidates:
+            maxc = self.bus.max_candidates() if self.bus else cfg.max_candidates
+            if maxc and dispatched >= maxc:
                 return False
             limit = wall_limit()   # live: the UI can raise/lower it mid-run
             if limit and time.time() - search_start >= limit:
@@ -623,15 +629,22 @@ class Orchestrator:
         def submit_one(ex: ThreadPoolExecutor) -> None:
             nonlocal dispatched
             have_elites = bool(pop.elites())
-            n_salvage = len(pop.salvageable()) if have_elites else 0
+            # Effective explore fraction: auto-schedule ramps from 80→20 over the run,
+            # or manual slider value if the user moved it.
+            if self.bus and not self.bus.explore_auto():
+                explore_frac = self.bus.explore_bias() / 100.0
+            elif cfg.max_candidates:
+                progress = min(1.0, dispatched / max(cfg.max_candidates, 1))
+                explore_frac = 0.8 - 0.6 * progress   # 0.8 → 0.8 → 0.2
+            else:
+                explore_frac = 0.5   # unbounded + no bus = equal
             op = evolve.choose_operator(
-                rng, {evolve.OP_EXPLORE: cfg.op_explore, evolve.OP_EXPLOIT: cfg.op_exploit,
-                      evolve.OP_SALVAGE: cfg.op_salvage},
-                have_elites=have_elites, n_salvage=n_salvage,
+                rng, {evolve.OP_EXPLORE: explore_frac, evolve.OP_EXPLOIT: 1.0 - explore_frac},
+                have_elites=have_elites,
                 n_niches=len(pop.niches()), min_niches=cfg.min_niches)
             parent = pop.select_parent(op, rng, in_flight)
-            if op != evolve.OP_EXPLORE and parent is None:
-                op = evolve.OP_EXPLORE   # nothing to exploit/salvage yet
+            if parent is None:
+                op = evolve.OP_EXPLORE   # no viable members to exploit or explore from
             mid = pop.next_id()
             prompt = self._evolve_prompt(op, parent, state,
                                          ", ".join(sorted(pop.niches().keys())))
@@ -673,7 +686,7 @@ class Orchestrator:
                     best = pop.best()
                     self._best = best.metric if best else self._best
                     ptxt = f"<-{task.parent_id} " if task.parent_id is not None else ""
-                    res = (f"{m.metric:.1f}{u} ✓ [{m.strategy}]" if m.viable
+                    res = (f"{m.metric:.1f}{u} ✓ [{m.commit_message[:50]}]" if m.viable
                            else f"✗ {m.error or 'no result'}")
                     self._log(f"result mem {m.id} ({m.operator} {ptxt}): {res}"
                               f"  · best {self._fmt(self._best)}{u}")
@@ -690,8 +703,10 @@ class Orchestrator:
         if best and best.commit:
             with self._git_lock:
                 gates.git(["reset", "--hard", best.commit], self.wd)
-            self._log(f"evolve: promoted mem {best.id} @ {best.metric:.1f}{u} "
-                      f"[{best.strategy}] to HEAD")
+            self._log(f"evolve: promoted mem {best.id} @ {best.metric:.1f}{u}"
+                      + (f" [{best.commit_message[:50]}]" if best.commit_message else "")
+                      + " to HEAD")
+            self._persist_best(best)
         else:
             self._log("evolve: no viable kernel found; HEAD unchanged")
         self._evolve_cleanup(state, pop, wt_root)
@@ -703,7 +718,35 @@ class Orchestrator:
                                 f"evolutionary search ({dispatched} candidates) found nothing viable")
         return self._finish(state, dirs, EXIT_MAXITER,
                             f"evolutionary search budget spent: {dispatched} candidates, "
-                            f"best {best.metric:.1f}{u} [{best.strategy}]")
+                            f"best {best.metric:.1f}{u} [{best.operator}]")
+
+    def _persist_best(self, best: evolve.Member) -> None:
+        """Copy the best kernel to a stable path that survives managed-repo wipes."""
+        out = self.cfg.problem_root / f"{self.problem.name}-best"
+        out.mkdir(parents=True, exist_ok=True)
+        for f in self.problem.edit_files:
+            src = self.wd / self.problem.rel_dir / f
+            shutil.copy(src, out / Path(f).name)
+        self._log(f"persisted best kernel to {out}")
+
+    def persist_current_head(self) -> None:
+        """Copy whatever kernel is at HEAD to the stable best-kernel path.
+        
+        Called on KeyboardInterrupt so a killed run still saves the last promoted
+        kernel, not just a clean exit."""
+        try:
+            head = self._git(["rev-parse", "HEAD"])
+        except Exception:
+            return
+        if head == getattr(self, '_base_commit', ''):
+            return
+        out = self.cfg.problem_root / f"{self.problem.name}-best"
+        out.mkdir(parents=True, exist_ok=True)
+        for f in self.problem.edit_files:
+            src = self.wd / self.problem.rel_dir / f
+            if src.is_file():
+                shutil.copy(src, out / Path(f).name)
+        self._log(f"persisted best kernel to {out}")
 
     def _evolve_cleanup(self, state: State, pop: evolve.Population, wt_root: Path) -> None:
         with self._git_lock:

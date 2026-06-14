@@ -32,7 +32,7 @@ from .bus import LoopBus
 PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
 <title>kernelthing</title><style>
  :root{--bg:#0e1116;--panel:#161b22;--line:#30363d;--line2:#21262d;--ink:#d6deeb;--dim:#9aa5b1;--mut:#6b7785;
-       --explore:#79c0ff;--exploit:#7ee787;--salvage:#e3b341;--seed:#9aa5b1;--bad:#f85149;--elite:#d2a8ff}
+       --explore:#79c0ff;--exploit:#7ee787;--seed:#9aa5b1;--bad:#f85149;--elite:#d2a8ff}
  *{box-sizing:border-box}
  body{font:14px/1.45 system-ui,sans-serif;margin:0;background:var(--bg);color:var(--ink)}
  header{padding:9px 16px;background:var(--panel);border-bottom:1px solid var(--line);
@@ -55,14 +55,15 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
  input{width:64px;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:4px}
  button{background:#238636;color:#fff;border:0;border-radius:4px;padding:6px 12px;cursor:pointer;font:inherit}
  button.stop{background:#da3633}
- button.mini{background:var(--line2);border:1px solid var(--line);color:var(--ink);padding:3px 8px;font-size:12px}
+  button.mini{background:var(--line2);border:1px solid var(--line);color:var(--ink);padding:3px 8px;font-size:12px}
+  button.mini.active{background:var(--exploit);color:#0e1116;font-weight:600}
  pre{background:var(--bg);border:1px solid var(--line2);border-radius:6px;padding:8px;max-height:340px;
      overflow:auto;font-size:12px;margin:0;white-space:pre-wrap;word-break:break-word}
- svg{display:block;width:100%}
+  svg{display:block;width:100%}
  /* operator badge */
  .op{display:inline-block;border-radius:4px;padding:0 6px;font-size:11px;font-weight:600;color:#0e1116}
- .op-explore{background:var(--explore)}.op-exploit{background:var(--exploit)}
- .op-salvage{background:var(--salvage)}.op-seed{background:var(--seed)}
+  .op-explore{background:var(--explore)}.op-exploit{background:var(--exploit)}
+  .op-seed{background:var(--seed)}
  /* agent cards */
  #agents{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px}
  .agent{border:1px solid var(--line);border-radius:7px;padding:9px;background:var(--bg);cursor:pointer;
@@ -97,23 +98,27 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
  <span class=pill id=agentsN>0 agents</span>
  <span class=pill id=clock>⏱ —</span>
  <span class=grow></span>
- <span id=ctl class=muted style=font-size:12px></span>
- <span id=clockCtl>limit <input id=W type=text title="wall-clock limit, e.g. 10m, 2h, 1d — 0 = off">
-   <button class=mini onclick=setW()>set</button></span>
- <button class=stop onclick=stop()>Stop</button>
- <span id=legacyCtl class=hidden>
-   N <input id=N type=number min=1> <button class=mini onclick=setN()>set</button>
- </span>
+  <span id=ctl class=muted style=font-size:12px></span>
+  <span id=exploreCtl>explore
+    <input id=E type=range min=0 max=100 value=50 style=width:80px;vertical-align:middle
+           title="explore/exploit bias — auto-schedule adjusts this over time">
+    exploit <b id=Eb>50</b>
+    <button class=mini id=Eauto onclick=autoE() title="re-enable auto-schedule">auto</button>
+  </span>
+  <span id=clockCtl>limit <input id=W type=text title="wall-clock limit, e.g. 10m, 2h, 1d — 0 = off">
+    <button class=mini onclick=setW()>set</button></span>
+  <span id=candCtl>cands <input id=M type=number min=0 value=0 style=width:50px>
+    <button class=mini onclick=setM()>set</button></span>
+  <button class=stop onclick=stop()>Stop</button>
 </header>
 <main>
  <div class=card>
    <h2>Best vs. kernels submitted <span class=sub id=chartSub></span></h2>
    <svg id=chart height=260 viewBox="0 0 1000 260" preserveAspectRatio=none></svg>
    <div class=legend>
-     <span><i style=background:var(--explore)></i>explore</span>
-     <span><i style=background:var(--exploit)></i>exploit</span>
-     <span><i style=background:var(--salvage)></i>salvage</span>
-     <span><i style=background:var(--seed)></i>seed</span>
+      <span><i style=background:var(--explore)></i>explore</span>
+      <span><i style=background:var(--exploit)></i>exploit</span>
+      <span><i style=background:var(--seed)></i>seed</span>
      <span><i style=background:var(--bad)></i>incorrect</span>
      <span>◆ best&nbsp;&nbsp;━ best-so-far</span>
    </div>
@@ -125,15 +130,15 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
  </div>
 
  <div class=row>
-   <div class=card id=nichesCard><h2>Niches <span class=sub>MAP-Elites · best kernel per strategy</span></h2>
+   <div class=card id=nichesCard><h2>Niches <span class=sub>best kernel per commit message</span></h2>
      <div id=niches></div></div>
    <div class=card id=lineageCard><h2>Lineage <span class=sub>parent → child mutations</span></h2>
      <div id=lineage></div></div>
  </div>
 
  <div class=card id=lbCard><h2>Leaderboard</h2>
-   <table><thead><tr><th>#</th><th>mem</th><th class=num>metric</th><th>op</th><th>strategy</th>
-     <th>parent</th><th>commit</th><th>headroom</th></tr></thead><tbody id=lb></tbody></table></div>
+    <table><thead><tr><th>#</th><th>mem</th><th class=num>metric</th><th>op</th><th>message</th>
+      <th>parent</th><th>commit</th></tr></thead><tbody id=lb></tbody></table></div>
 
  <div class=card id=sbCard class=hidden><h2>Scoreboard</h2>
    <table><thead><tr><th>cand</th><th>status</th><th class=num>metric</th><th>commit</th><th>note</th></tr></thead>
@@ -148,7 +153,7 @@ let UNIT="",DIR="maximize",MODE="";
 let selFile=null;               // transcript currently shown (auto-refreshed)
 const $=id=>document.getElementById(id);
 const fmt=v=>v==null?'-':(Math.round(v*10)/10)+UNIT;
-const opClass=op=>'op op-'+(['explore','exploit','salvage','seed'].includes(op)?op:'seed');
+const opClass=op=>'op op-'+(['explore','exploit','seed'].includes(op)?op:'seed');
 const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 // ---- wall-clock timer (server gives epoch start + live limit; client ticks) ----
 let CLOCK={start:null,elapsed:0,limit:0,running:false};
@@ -160,6 +165,7 @@ function renderClock(){const ck=CLOCK;let el=ck.elapsed||0;if(ck.running&&ck.sta
  $('clock').innerHTML='⏱ <b'+(over?' style=color:var(--bad)':'')+'>'+hum(el)+'</b> / '+(ck.limit?hum(ck.limit):'∞');
  if(document.activeElement.id!=='W')$('W').value=ck.limit?fmtDur(ck.limit):'0';}
 function setW(){ctl({wall_clock:$('W').value});}
+function setM(){ctl({max_candidates:+$('M').value});}
 const memLog=m=>`mem-${m.id}-${m.op}-opencode.log`;
 const better=(a,b)=>DIR==='maximize'?a>b:a<b;   // a strictly better than b
 
@@ -179,17 +185,28 @@ async function poll(){
   CLOCK=Object.assign({},CLOCK,s.clock||{});
   if(c.wall_clock_s!=null)CLOCK.limit=c.wall_clock_s;   // live bus value wins
   renderClock();
+  if(document.activeElement.id!=='M'){
+    const mc=c.max_candidates!=null?c.max_candidates:0;
+    $('M').value=mc||'';
+  }
+  // explore bias slider — read live value from server if not currently focused
+  if(document.activeElement.id!=='E'){
+    const eb=c.explore_bias!=null?c.explore_bias:50;
+    $('E').value=eb;$('Eb').textContent=eb;
+    if(c.explore_auto){$('Eauto').classList.add('active');$('E').disabled=true;}
+    else{$('Eauto').classList.remove('active');$('E').disabled=false;}
+  }
 
-  if(MODE==='evolve'){
-   $('sbCard').classList.add('hidden');$('legacyCtl').classList.add('hidden');
-   $('agentsCard').classList.remove('hidden');
+   if(MODE==='evolve'){
+    $('sbCard').classList.add('hidden');
+    $('agentsCard').classList.remove('hidden');
    $('nichesCard').classList.remove('hidden');$('lineageCard').classList.remove('hidden');$('lbCard').classList.remove('hidden');
    const mem=s.members||[];
    drawChart(mem);drawAgents(agents);drawNiches(mem);drawLineage(mem);drawLeaderboard(mem);
-  }else{
-   // legacy tournament / sequential: scoreboard + history chart
-   $('sbCard').classList.remove('hidden');$('legacyCtl').classList.remove('hidden');
-   $('agentsCard').classList.add('hidden');
+   }else{
+    // legacy tournament / sequential: scoreboard + history chart
+    $('sbCard').classList.remove('hidden');
+    $('agentsCard').classList.add('hidden');
    $('nichesCard').classList.add('hidden');$('lineageCard').classList.add('hidden');$('lbCard').classList.add('hidden');
    if(document.activeElement.id!=='N')$('N').value=c.parallelism??'';
    drawScoreboard(s.scoreboard||[]);
@@ -203,6 +220,7 @@ async function poll(){
 /* ---------- fitness chart: best-so-far staircase + every attempt ---------- */
 function drawChart(mem){
  const svg=$('chart'),W=1000,H=260,pl=46,pr=12,pt=12,pb=22;
+ if(!svg)return;
  const pts=mem.filter(m=>m.metric!=null);
  if(!pts.length){svg.innerHTML='<text x=12 y=24 fill=#6b7785 font-size=13>no kernels scored yet</text>';
   $('chartSub').textContent='';return;}
@@ -210,15 +228,15 @@ function drawChart(mem){
  let ys=pts.filter(m=>m.correct).map(m=>m.metric);
  if(!ys.length)ys=pts.map(m=>m.metric);
  const x0=Math.min(...xs),x1=Math.max(...xs,x0+1);
- let y0=Math.min(...ys),y1=Math.max(...ys);if(y1===y0){y1+=1;y0-=1;}
+ let y0=ys.length?Math.min(...ys):0,y1=ys.length?Math.max(...ys):100;if(y1===y0){y1+=1;y0-=1;}
  const padY=(y1-y0)*0.08;y0-=padY;y1+=padY;
  const X=v=>pl+(W-pl-pr)*(v-x0)/(x1-x0||1);
  const Y=v=>H-pb-(H-pt-pb)*(v-y0)/((y1-y0)||1);
  let g='';
  // grid + y labels
- for(let i=0;i<=4;i++){const yv=y0+(y1-y0)*i/4,y=Y(yv);
-  g+=`<line x1=${pl} y1=${y} x2=${W-pr} y2=${y} stroke=#21262d/>`+
-     `<text x=${pl-6} y=${y+4} fill=#6b7785 font-size=11 text-anchor=end>${yv.toFixed(0)}</text>`;}
+ for(let i=0;i<=4;i++){const yv=y0+(y1-y0)*i/4,yy=Y(yv);
+  g+=`<line x1=${pl} y1=${yy} x2=${W-pr} y2=${yy} stroke=#21262d/>`+
+     `<text x=${pl-6} y=${yy+4} fill=#6b7785 font-size=11 text-anchor=end>${yv.toFixed(0)}</text>`;}
  // best-so-far staircase (correct points only)
  const sorted=pts.slice().sort((a,b)=>a.id-b.id);let run=null,step=[];
  for(const m of sorted){if(m.correct&&(run==null||better(m.metric,run))){
@@ -226,9 +244,9 @@ function drawChart(mem){
  if(run!=null)step.push([X(x1),Y(run)]);
  if(step.length)g+=`<polyline fill=none stroke=#7ee787 stroke-width=2 points="${step.map(p=>p[0]+','+p[1]).join(' ')}"/>`;
  // every attempt as a dot
- const col={explore:'#79c0ff',exploit:'#7ee787',salvage:'#e3b341',seed:'#9aa5b1'};
- for(const m of pts){const x=X(m.id),y=Y(m.metric);
-  if(!m.correct){g+=`<path d="M${x-3} ${y-3}L${x+3} ${y+3}M${x-3} ${y+3}L${x+3} ${y-3}" stroke=#f85149 stroke-width=1.5/>`;continue;}
+  const col={explore:'#79c0ff',exploit:'#7ee787',seed:'#9aa5b1'};
+  for(const m of pts){const x=X(m.id),y=Y(m.metric);
+   if(!m.correct){g+=`<path d="M${x-3} ${y-3}L${x+3} ${y+3}M${x-3} ${y+3}L${x+3} ${y-3}" stroke=#f85149 stroke-width=1.5/>`;continue;}
   if(m.best){g+=`<path d="M${x} ${y-6}L${x+6} ${y}L${x} ${y+6}L${x-6} ${y}Z" fill=#d2a8ff stroke=#fff stroke-width=1/>`;}
   else{g+=`<circle cx=${x} cy=${y} r=3 fill=${col[m.op]||'#9aa5b1'}/>`;}}
  g+=`<text x=${(pl+W-pr)/2} y=${H-4} fill=#6b7785 font-size=11 text-anchor=middle>kernels submitted →</text>`;
@@ -252,18 +270,20 @@ function drawAgents(agents){
     <div class=meta>⚙ ${a.tools||0} tools${cost}</div>${tool}${text}</div>`;}).join('');
 }
 
-/* ---------- MAP-Elites niches: best viable member per strategy ---------- */
+/* ---------- Niches: best viable member per commit message ---------- */
 function drawNiches(mem){
  const grid={};
  for(const m of mem){if(!m.correct||m.metric==null)continue;
-  const g=grid[m.strategy];if(!g||better(m.metric,g.metric)){grid[m.strategy]={...m,count:(g?g.count:0)+1};}
+  const k=m.message||'uncategorized';
+  const g=grid[k];if(!g||better(m.metric,g.metric)){grid[k]={...m,count:(g?g.count:0)+1};}
   else{g.count++;}}
  const list=Object.values(grid).sort((a,b)=>better(a.metric,b.metric)?-1:1);
  if(!list.length){$('niches').innerHTML='<div class=muted>no niches yet</div>';return;}
  const ms=list.map(n=>n.metric);const lo=Math.min(...ms),hi=Math.max(...ms);
  $('niches').innerHTML=list.map(n=>{
   const w=hi===lo?100:Math.max(6,(DIR==='maximize'?(n.metric-lo)/(hi-lo):(hi-n.metric)/(hi-lo))*100);
-  return `<div class=niche><div class=lbl><span class=s title="${esc(n.strategy)}">${esc(n.strategy)}</span>
+  const lbl=n.message||'uncategorized';
+  return `<div class=niche><div class=lbl><span class=s title="${esc(lbl)}">${esc(lbl)}</span>
     <span class=good>${fmt(n.metric)} <span class=muted>×${n.count}</span></span></div>
     <div class=track><div class=fill style=width:${w}%></div></div></div>`;}).join('');
 }
@@ -271,8 +291,8 @@ function drawNiches(mem){
 /* ---------- lineage tree from parent links ---------- */
 function drawLineage(mem){
  const by={},kids={};for(const m of mem){by[m.id]=m;(kids[m.parent]=kids[m.parent]||[]).push(m);}
- const col={explore:'#79c0ff',exploit:'#7ee787',salvage:'#e3b341',seed:'#9aa5b1'};
- const roots=mem.filter(m=>m.parent==null||!(m.parent in by)).sort((a,b)=>a.id-b.id);
+  const col={explore:'#79c0ff',exploit:'#7ee787',seed:'#9aa5b1'};
+  const roots=mem.filter(m=>m.parent==null||!(m.parent in by)).sort((a,b)=>a.id-b.id);
  let out='';
  const walk=(m,depth)=>{
   const c=m.correct?(col[m.op]||'#9aa5b1'):'#f85149';
@@ -289,14 +309,12 @@ function drawLineage(mem){
 /* ---------- leaderboard ---------- */
 function drawLeaderboard(mem){
  const v=mem.filter(m=>m.correct&&m.metric!=null).sort((a,b)=>better(a.metric,b.metric)?-1:1).slice(0,10);
- if(!v.length){$('lb').innerHTML='<tr><td colspan=8 class=muted>no viable kernels yet</td></tr>';return;}
- $('lb').innerHTML=v.map((m,i)=>{
-  const head=m.ceiling!=null?`ceil≈${fmt(m.ceiling)}`:'';const wall=m.wall&&m.wall!=='unknown'?` ${m.wall}`:'';
-  return `<tr onclick="loadTx('${memLog(m)}',null)" style=cursor:pointer>
-    <td>${m.best?'◆':(i+1)}</td><td>mem ${m.id}</td><td class="num good">${fmt(m.metric)}</td>
-    <td><span class=${opClass(m.op)}>${m.op}</span></td><td>${esc(m.strategy)}</td>
-    <td class=muted>${m.parent!=null?'mem '+m.parent:'—'}</td><td class=muted>${esc(m.commit)}</td>
-    <td class=muted>${esc(head+wall)}</td></tr>`;}).join('');
+ if(!v.length){$('lb').innerHTML='<tr><td colspan=7 class=muted>no viable kernels yet</td></tr>';return;}
+  $('lb').innerHTML=v.map((m,i)=>{
+   return `<tr onclick="loadTx('${memLog(m)}',null)" style=cursor:pointer>
+     <td>${m.best?'◆':(i+1)}</td><td>mem ${m.id}</td><td class="num good">${fmt(m.metric)}</td>
+     <td><span class=${opClass(m.op)}>${m.op}</span></td><td>${esc(m.message||'')}</td>
+     <td class=muted>${m.parent!=null?'mem '+m.parent:'—'}</td><td class=muted>${esc(m.commit)}</td></tr>`;}).join('');
 }
 
 /* ---------- legacy scoreboard (tournament / sequential) ---------- */
@@ -333,6 +351,10 @@ async function refreshLog(){
 async function ctl(b){await fetch('/api/control',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)});}
 function setN(){ctl({parallelism:+$('N').value})}
 function stop(){if(confirm('Stop the search? (in-flight work finishes, best kernel is kept)'))ctl({stop:true})}
+function setE(){ctl({explore_bias:+$('E').value});$('Eauto').classList.remove('active');$('E').disabled=false;$('Eb').textContent=$('E').value;}
+function autoE(){ctl({explore_auto:true})}
+$('E').addEventListener('input',()=>{$('Eb').textContent=$('E').value;});
+$('E').addEventListener('change',setE);
 setInterval(renderClock,1000);   // tick the elapsed timer between polls
 poll();
 </script></body></html>"""
@@ -488,6 +510,12 @@ def _make_handler(bus: LoopBus):
                     bus.set_wall_clock(parse_duration(body["wall_clock"]))
                 except (ValueError, TypeError):
                     pass   # ignore unparseable input; UI keeps the prior limit
+            if "explore_bias" in body:
+                bus.set_explore_bias(body["explore_bias"])
+            if "explore_auto" in body:
+                bus.set_explore_auto()
+            if "max_candidates" in body:
+                bus.set_max_candidates(body["max_candidates"])
             if "stop" in body and body["stop"]:
                 bus.request_stop()
             self._send(200, json.dumps({"ok": True}))

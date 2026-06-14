@@ -9,6 +9,7 @@ bound through so kernels can compile and run.
 """
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -27,6 +28,15 @@ NVIDIA_NODES = [
 NVIDIA_CAPS_NODES = [
     "/dev/nvidia-caps/nvidia-cap1",
     "/dev/nvidia-caps/nvidia-cap2",
+]
+
+# opencode loads skills from these directories. Mask them entirely so no
+# user-level skills (flywheel, prose-restructurer, etc.) load into the agent's
+# system prompt. The loop provides its own kernel-domain tooling via prompt
+# injection; user skills are pure noise.
+_SKILL_HOMES = [
+    Path.home() / ".claude" / "skills",
+    Path.home() / ".agents" / "skills",
 ]
 
 
@@ -89,6 +99,11 @@ def wrap(
     # (same inode as the host => flock coordinates across the sandbox boundary).
     if gpu_lock is not None and Path(gpu_lock).exists():
         args += ["--bind", str(gpu_lock), str(gpu_lock)]
+
+    # Mask skill directories so opencode loads no user-level skills.
+    for home in _SKILL_HOMES:
+        if home.exists():
+            args += ["--tmpfs", str(home)]
 
     # Run inside the project worktree.
     args += ["--chdir", str(project_dir)]

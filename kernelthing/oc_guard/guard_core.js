@@ -152,10 +152,16 @@ function checkWriteLike(cfg, filePath, resultingContent) {
       const rel = path.relative(cfg.editDir, abs);
       const hasBuildPrefix = rel.split(path.sep).some(seg => seg.startsWith("_"));
       const isBuildArtifact = hasBuildPrefix || nameLower === ".gitignore" || nameLower === "bootstrap-prompt.md" || nameLower.startsWith(".humanize");
-      if (!isEditFile && !isBuildArtifact) {
+      const isSummaryFile = nameLower === "candidate-summary.md";
+      if (!isEditFile && !isBuildArtifact && !isSummaryFile) {
         return block(cfg, "edit-file-protected",
           { EDIT_FILES: cfg.editFiles.join(", ") },
           "# Edit Blocked\n\nOnly the designated edit files may be modified in this problem directory:\n\n  " + cfg.editFiles.join("\n  "));
+      }
+      if (isSummaryFile && resultingContent != null && resultingContent.length > 1000) {
+        return block(cfg, null, {},
+          "# Summary too long\n\ncandidate-summary.md must be under 1000 characters "
+          + `(yours is ${resultingContent.length}). Shorten it to 2-3 sentences or a few bullet points.`);
       }
       if (isProtected) {
         return block(cfg, "edit-file-protected",
@@ -370,6 +376,16 @@ function checkBash(cfg, command) {
       "Wrap GPU commands in the shared-GPU lock so only one agent uses the device " +
       `at a time, e.g.  ${gr} ncu --set full ...`);
   }
+  // Python commands that import torch/cuda/pycuda likely touch the GPU: require
+  // gpu-run wrapping. bash -c 'python ...' / python3 -c '...' / python script.py
+  const PY_GPU = /(?:^|[\s;&|(>])(?:[^\s;&|()]*\/)?(python[23]?)\s+(?:-c\s+['\"]|(?:[^\s;&|()]*\/)?([^\s]*(?:bench|test|score|run)[^\s]*\.py))/.test(c);
+  const HAS_GPU_IMPORT = /\b(?:import\s+torch|import\s+cuda|from\s+torch|from\s+cuda|torch\.cuda|cudaDevice|cuInit|cuCtx)\b/.test(c);
+  if (PY_GPU && HAS_GPU_IMPORT && !/\b(flock|gpu[_-]run)\b/.test(c)) {
+    const gr = cfg.gpuRun || "gpu-run";
+    return block(cfg, "gpu-unlocked", { GPU_RUN: gr },
+      "Wrap GPU commands in the shared-GPU lock so only one agent uses the device " +
+      `at a time, e.g.  ${gr} python3 -c 'import torch; ...'`);
+  }
   return null;
 }
 
@@ -383,7 +399,8 @@ export function decide(cfg, tool, args) {
       return checkWriteLike(cfg, args.filePath, args.content);
     case "edit": {
       let resulting = null;
-      if (lower(baseName(args.filePath || "")) === "goal-tracker.md") {
+      const nameLower = lower(baseName(args.filePath || ""));
+      if (nameLower === "goal-tracker.md" || nameLower === "candidate-summary.md") {
         resulting = applyEdit(absPath(cfg, args.filePath), args.oldString, args.newString, !!args.replaceAll);
       }
       return checkWriteLike(cfg, args.filePath, resulting);

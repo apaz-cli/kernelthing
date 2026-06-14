@@ -62,7 +62,7 @@ the best of all-correct runs. Hold your own problems to the same standard.
 `http://127.0.0.1:<port>` (stdlib-only, zero deps). Live search view:
 
 - **Best vs. submitted** — best-so-far staircase chart with each attempt a dot
-  colored by operator (explore/exploit/salvage), failures marked.
+  colored by operator (explore/exploit), failures marked.
 - **Agents (live)** — cards showing operator, parent, tool-call count, cost, and
   the latest tool call + reasoning line from the streaming opencode log. Click for
   full transcript.
@@ -85,24 +85,18 @@ tasks like benchmarking, and allows us to maintain idea diversity.
 
 Results flow back continuously, so the GPU is always fed and agents always working.
 
-**Three operators**, with compute budget split across them:
+**Two operators**, with compute budget split across them:
 
 | Operator | Purpose | How |
 |---|---|---|
 | **Explore** (breadth) | new lineages | start from a seed, take a strategy *not yet in the archive* |
 | **Exploit** (depth) | deepen winners | refine a top scoring commit |
-| **Salvage / crossover** | rescue near-misses | fix the *named* reason a stalled candidate underperformed, or merge two ideas |
 
 **Diversity via MAP-Elites** niches keyed on agent-reported strategy descriptors
 (tiling, vectorization, tensor-core use, …): the best kernel *per niche* is kept,
 and exploration targets empty niches so the search can't collapse onto one lineage.
 
-**Prune vs. salvage uses agent judgment, backstopped by the metric.** Each candidate
-self-triages — `fundamental` vs. `fixable` plus an estimated ceiling. That judgment
-only *allocates compute*; the measured score still decides what is elite.
-
-**Honesty**: the measured benchmark is the only thing that decides what is elite or
-gets promoted. The run stops on a global budget (wall-clock / candidate count), not a
+**The measured benchmark is the only thing that decides what is elite or gets promoted.** The run stops on a global budget (wall-clock / candidate count), not a
 round count. `-j` sets max concurrent agents; all GPU work stays serialized.
 
 **One GPU at a time.** A per-device `flock` (`kernelthing/gpulock.py`) keyed on the

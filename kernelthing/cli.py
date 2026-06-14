@@ -145,7 +145,7 @@ def _run(args: argparse.Namespace) -> int:
     bus = None
     if not args.no_web:
         from . import webui
-        bus = LoopBus(args.parallelism, args.wall_clock)
+        bus = LoopBus(args.parallelism, args.wall_clock, args.max_candidates)
         try:
             _httpd, port = webui.start_server(bus, port=args.web_port)
             print(f"[kernelthing] web UI:   http://127.0.0.1:{port}", file=sys.stderr)
@@ -167,6 +167,7 @@ def _run(args: argparse.Namespace) -> int:
         exit_reason = orch.run()
     except KeyboardInterrupt:
         print("\n[kernelthing] interrupted", file=sys.stderr)
+        orch.persist_current_head()
         return 130
     print(f"[kernelthing] loop finished: {exit_reason}", file=sys.stderr)
     # complete / stalled_out / stopped / maxiter all leave a correct HEAD.
@@ -240,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     models.add_argument("--model", default="deepseek/deepseek-v4-pro",
                         help="opencode model that edits kernels and authors problems "
                              "(default: %(default)s)")
-    models.add_argument("--timeout", type=int, default=5400,
+    models.add_argument("--timeout", type=int, default=1200,
                         help="per-opencode-turn timeout in seconds (default: %(default)s)")
 
     boot = parser.add_argument_group("bootstrap (authoring a new problem)")

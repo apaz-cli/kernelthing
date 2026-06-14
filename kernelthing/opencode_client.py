@@ -114,8 +114,10 @@ def run_interactive(
     if prompt:
         inner += ["--prompt", prompt]
 
+    # GPU mutex wrapper: bound after --tmpfs /tmp so it reaches through the mask
     env = dict(os.environ)
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["KERNELTHING_GPU_INDEX"] = str(gpu_index)
     if gpu_lock is not None:
         env["KERNELTHING_GPU_LOCK"] = str(gpu_lock)
     # Disable opencode's snapshot feature (see ``run`` for why it is so costly here).
@@ -193,7 +195,8 @@ def run(
         inner += ["-s", session]
 
     env = dict(os.environ)
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["KERNELTHING_GPU_INDEX"] = str(gpu_index)
     if gpu_lock is not None:
         env["KERNELTHING_GPU_LOCK"] = str(gpu_lock)
 

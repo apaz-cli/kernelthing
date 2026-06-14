@@ -19,7 +19,8 @@ def test_bus_loop_dir_and_snapshot():
     assert bus.loop_dir() == "/tmp/x"
     snap = bus.snapshot()
     assert snap["round"] == 2
-    assert snap["control"] == {"parallelism": 3, "stop": False}
+    assert snap["control"] == {"parallelism": 3, "stop": False, "wall_clock_s": 0,
+                                "max_candidates": 0, "explore_bias": 50, "explore_auto": True}
     assert snap["log"] == []
 
 
