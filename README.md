@@ -7,6 +7,12 @@ baseline and keeping only genuine improvements. Originally a DSV4/Opencode
 reimplementation of [Humanize](https://github.com/PolyArch/humanize), but now
 is rather different and has many more features.
 
+<br>
+
+![kernelthing in action](images/kernel_autoresearch_run.png)
+
+<br>
+
 ## Setup
 
 ```bash

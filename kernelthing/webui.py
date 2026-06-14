@@ -82,7 +82,8 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
  .track{background:var(--line2);border-radius:3px;height:8px;overflow:hidden}
  .fill{height:100%;background:linear-gradient(90deg,#1f6feb,var(--exploit))}
  /* lineage */
- #lineage{font:12px ui-monospace,Menlo,monospace;max-height:340px;overflow:auto}
+ #lineageCard{display:flex;flex-direction:column}
+ #lineage{font:12px ui-monospace,Menlo,monospace;flex:1;min-height:0;overflow:auto}
  .node{display:flex;align-items:center;gap:6px;padding:1px 0}
  .node .dot{width:8px;height:8px;border-radius:50%;flex:none}
  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--dim);margin-top:8px}
@@ -114,7 +115,7 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
 <main>
  <div class=card>
    <h2>Best vs. kernels submitted <span class=sub id=chartSub></span></h2>
-   <svg id=chart height=260 viewBox="0 0 1000 260" preserveAspectRatio=none></svg>
+   <svg id=chart height=260></svg>
    <div class=legend>
       <span><i style=background:var(--explore)></i>explore</span>
       <span><i style=background:var(--exploit)></i>exploit</span>
@@ -219,8 +220,11 @@ async function poll(){
 
 /* ---------- fitness chart: best-so-far staircase + every attempt ---------- */
 function drawChart(mem){
- const svg=$('chart'),W=1000,H=260,pl=46,pr=12,pt=12,pb=22;
+ const svg=$('chart'),H=260,pl=46,pr=12,pt=12,pb=22;
  if(!svg)return;
+ // render at real pixel width (1 unit = 1px) so markers/strokes don't warp
+ const W=Math.max(320,Math.round(svg.clientWidth||svg.getBoundingClientRect().width||1000));
+ svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
  const pts=mem.filter(m=>m.metric!=null);
  if(!pts.length){svg.innerHTML='<text x=12 y=24 fill=#6b7785 font-size=13>no kernels scored yet</text>';
   $('chartSub').textContent='';return;}
@@ -235,20 +239,20 @@ function drawChart(mem){
  let g='';
  // grid + y labels
  for(let i=0;i<=4;i++){const yv=y0+(y1-y0)*i/4,yy=Y(yv);
-  g+=`<line x1=${pl} y1=${yy} x2=${W-pr} y2=${yy} stroke=#21262d/>`+
+  g+=`<line x1=${pl} y1=${yy} x2=${W-pr} y2=${yy} stroke=#21262d />`+
      `<text x=${pl-6} y=${yy+4} fill=#6b7785 font-size=11 text-anchor=end>${yv.toFixed(0)}</text>`;}
  // best-so-far staircase (correct points only)
  const sorted=pts.slice().sort((a,b)=>a.id-b.id);let run=null,step=[];
  for(const m of sorted){if(m.correct&&(run==null||better(m.metric,run))){
    if(run!=null)step.push([X(m.id),Y(run)]);run=m.metric;step.push([X(m.id),Y(run)]);}}
  if(run!=null)step.push([X(x1),Y(run)]);
- if(step.length)g+=`<polyline fill=none stroke=#7ee787 stroke-width=2 points="${step.map(p=>p[0]+','+p[1]).join(' ')}"/>`;
+ if(step.length)g+=`<polyline fill=none stroke=#7ee787 stroke-width=2 points="${step.map(p=>p[0]+','+p[1]).join(' ')}" />`;
  // every attempt as a dot
   const col={explore:'#79c0ff',exploit:'#7ee787',seed:'#9aa5b1'};
   for(const m of pts){const x=X(m.id),y=Y(m.metric);
-   if(!m.correct){g+=`<path d="M${x-3} ${y-3}L${x+3} ${y+3}M${x-3} ${y+3}L${x+3} ${y-3}" stroke=#f85149 stroke-width=1.5/>`;continue;}
-  if(m.best){g+=`<path d="M${x} ${y-6}L${x+6} ${y}L${x} ${y+6}L${x-6} ${y}Z" fill=#d2a8ff stroke=#fff stroke-width=1/>`;}
-  else{g+=`<circle cx=${x} cy=${y} r=3 fill=${col[m.op]||'#9aa5b1'}/>`;}}
+   if(!m.correct){g+=`<path d="M${x-3} ${y-3}L${x+3} ${y+3}M${x-3} ${y+3}L${x+3} ${y-3}" stroke=#f85149 stroke-width=1.5 />`;continue;}
+  if(m.best){g+=`<path d="M${x} ${y-6}L${x+6} ${y}L${x} ${y+6}L${x-6} ${y}Z" fill=#d2a8ff stroke=#fff stroke-width=1 />`;}
+  else{g+=`<circle cx=${x} cy=${y} r=3 fill=${col[m.op]||'#9aa5b1'} />`;}}
  g+=`<text x=${(pl+W-pr)/2} y=${H-4} fill=#6b7785 font-size=11 text-anchor=middle>kernels submitted →</text>`;
  svg.innerHTML=g;
  const ok=pts.filter(m=>m.correct).length;
