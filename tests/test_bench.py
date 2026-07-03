@@ -26,27 +26,6 @@ def test_has_setup_blocked():
     assert not gates.has_setup_blocked("SETUP_BLOCKED\ntrailing text")
 
 
-# --- parse_score (the cfg.pygpubench=False fallback that reads score_command JSON) ---
-
-
-def test_parse_score_basic():
-    assert bench.parse_score('{"correct": true, "metric": 88.0, "unit": "%cuBLAS"}') == (True, 88.0)
-    assert bench.parse_score('{"correct": false, "metric": 0}') == (False, 0.0)
-
-
-def test_parse_score_last_json_amid_logs():
-    out = 'make: building\nptxas info...\n{"correct": true, "metric": 91.5}\n'
-    assert bench.parse_score(out) == (True, 91.5)
-
-
-def test_parse_score_none_when_absent():
-    assert bench.parse_score("no json here\nbuild failed") == (False, None)
-
-
-def test_parse_score_int_metric():
-    assert bench.parse_score('{"correct": true, "metric": 7}') == (True, 7.0)
-
-
 # --- fake pygpubench harness for the scorer ---
 
 
@@ -134,7 +113,6 @@ def _problem(root):
         edit_files=["prob/submission.py"],
         score_command="",
         direction="maximize",
-        bench_runs=1,
         bench={
             "submission_qualname": "submission.kernel",
             "task_module": "task",
@@ -166,11 +144,3 @@ def test_score_latency_metric(tmp_path, fake_pygpubench):
     prob.metric = {"kind": "latency_us"}
     correct, metric, _err = bench.score(prob, tmp_path)
     assert correct and metric == pytest.approx(10.0)
-
-
-def test_score_missing_pygpubench(tmp_path, monkeypatch):
-    # No fake injected and not installed -> a clear error, not an exception.
-    monkeypatch.setitem(sys.modules, "pygpubench", None)
-    _write_problem_dir(tmp_path)
-    correct, _metric, err = bench.score(_problem(tmp_path), tmp_path)
-    assert correct is False and "pygpubench" in err

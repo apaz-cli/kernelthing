@@ -5,7 +5,7 @@ opencode 1.15.13 facts this relies on (see README):
 - ``--format json`` emits **newline-delimited JSON events** (step_start / text /
   tool / step_finish); the assistant reply is the concatenation of ``text``
   parts, and every event carries ``sessionID``;
-- ``-s <id>`` continues a session; ``--dangerously-skip-permissions`` auto-approves
+- ``-s <id>`` continues a session; ``--auto`` auto-approves
   tool use (safe only because the run is bwrap-sandboxed).
 """
 
@@ -24,11 +24,6 @@ from . import gpulock, sandbox
 # The PreToolUse guard plugin and the block-message templates it renders.
 GUARD_PLUGIN = Path(__file__).resolve().parent / "oc_guard" / "guard.js"
 GUARD_BLOCK_DIR = Path(__file__).resolve().parent.parent / "prompts" / "block"
-
-# GPU-lock LD_PRELOAD shim (compiled from native/ktgpu.c by setup.py's build hook).
-# Injected into every agent-spawned process so the first CUDA call claims a free
-# card from the pool; see native/ktgpu.c and gpulock.gpu_pool_spec.
-GPU_SHIM = Path(__file__).resolve().parent / "libktgpu.so"
 
 
 def opencode_state_dirs() -> list[Path]:
@@ -102,13 +97,7 @@ def build_opencode_env(
     rather than an unlocked one.
     """
     env = dict(os.environ)
-    env["CUDA_VISIBLE_DEVICES"] = ""
-    pool_spec = gpulock.gpu_pool_spec(gpu_pool)
-    if pool_spec:
-        env["KERNELTHING_GPU_POOL"] = pool_spec
-    if GPU_SHIM.exists():
-        prev = env.get("LD_PRELOAD", "")
-        env["LD_PRELOAD"] = f"{GPU_SHIM}:{prev}" if prev else str(GPU_SHIM)
+    gpulock.apply_shim_env(env, gpu_pool)
 
     oc_config: dict[str, Any] = {"snapshot": False}
     if guard is not None:
@@ -226,7 +215,7 @@ def run(
         "json",
         "-m",
         model,
-        "--dangerously-skip-permissions",
+        "--auto",
         "--dir",
         str(Path(working_dir).resolve()),
     ]

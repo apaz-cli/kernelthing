@@ -69,9 +69,6 @@ class Config:
 
     # --- agent tools & sandboxing ---
     sandbox: bool = True
-    # pygpubench: default scoring engine (adversarial sandboxed subprocess,
-    # kernelthing/bench.py). Off -> fall back to the plain ``score_command``.
-    pygpubench: bool = True
     # kernelguard: static cheat detection (timer monkeypatching, result/CUDA-graph
     # replay, shape hardcoding, ...). On by default; disqualifies cheaters.
     kernelguard: bool = True

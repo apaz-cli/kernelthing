@@ -8,10 +8,8 @@ step -- the runtime half kernelguard's static scan can't cover.
 
 This module is the single entry point the orchestrator calls
 (``bench.score(problem, worktree)``); there is no CLI and no ``python -m`` path.
-pygpubench (and torch) are imported **lazily**: with pygpubench scoring turned off
-(``cfg.pygpubench=False``) the loop falls back to the plain ``score_command`` and
-needs neither, and a missing pygpubench degrades to a clear scoring error rather
-than breaking the loop's import.
+pygpubench (and torch) are imported **lazily**: a missing pygpubench surfaces a
+clear scoring error rather than breaking the loop's import.
 
 The contract a pygpubench problem ships in its problem dir:
   * ``submission.py`` -- the editable kernel adapter; exposes the function named
@@ -34,8 +32,8 @@ an earlier one's code (same module name, different file on disk).
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import importlib
-import json
 import os
 import re
 import signal
@@ -54,11 +52,9 @@ from .problem import Problem
 # KERNELTHING_GPU_POOL) while a pygpubench subprocess inherits them.
 _env_lock = threading.Lock()
 
-# libktgpu.so LD_PRELOAD shim, compiled next to this package by setup.py's build
-# hook. Handed to pygpubench's isolated worker so it flocks a GPU on first use.
-_GPU_SHIM = Path(__file__).resolve().parent / "libktgpu.so"
-
-JSON_OBJ = re.compile(r"\{.*\}")
+# Protects the in-process sys.path / sys.modules / cwd mutation inside _importable
+# so concurrent scorings don't race on the shared import state.
+_import_lock = threading.Lock()
 
 # pygpubench raises ``RuntimeError('Benchmark subprocess failed with exit code N')``
 # when the supervised benchmark process dies. A *negative* N is Python's convention
@@ -103,34 +99,6 @@ def explain_bench_error(e: BaseException) -> str:
     )
 
 
-def parse_score(stdout: str) -> tuple[bool, float | None]:
-    """Return (correct, metric) from the last JSON line emitted by a score command.
-
-    Used only by the ``cfg.pygpubench=False`` fallback (the plain ``score_command``
-    path). Tolerates extra non-JSON output (build logs etc.): scans bottom-up for
-    the last line that parses as a JSON object containing ``correct`` and ``metric``.
-    """
-    for line in reversed(stdout.splitlines()):
-        line = line.strip()
-        if not (line.startswith("{") and line.endswith("}")):
-            m = JSON_OBJ.search(line)
-            if not m:
-                continue
-            line = m.group(0)
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict) and "correct" in obj and "metric" in obj:
-            metric = obj["metric"]
-            try:
-                metric = float(metric)
-            except (TypeError, ValueError):
-                metric = None
-            return bool(obj["correct"]), metric
-    return False, None
-
-
 # Module names we own in a problem dir; purged before/after each scoring so two
 # worktrees with the same module name but different files never alias.
 _PROBLEM_MODULES = ("submission", "task", "baseline")
@@ -170,16 +138,6 @@ def resolve_bench_config(problem: Problem, worktree: Path) -> _BenchSetup:
     )
 
 
-def available() -> bool:
-    """True if pygpubench can be imported (it and torch are optional deps)."""
-    try:
-        import pygpubench  # noqa: F401
-
-        return True
-    except Exception:
-        return False
-
-
 def _purge_problem_modules() -> None:
     for name in list(sys.modules):
         if name in _PROBLEM_MODULES or name.split(".", 1)[0] in _PROBLEM_MODULES:
@@ -192,23 +150,24 @@ def _importable(prob_dir: Path) -> Generator[None, None, None]:
     prob_dir_str = str(prob_dir)
     old_cwd = os.getcwd()
     old_pp = os.environ.get("PYTHONPATH")
-    _purge_problem_modules()
-    sys.path.insert(0, prob_dir_str)
-    os.environ["PYTHONPATH"] = os.pathsep.join(
-        [prob_dir_str, *(old_pp.split(os.pathsep) if old_pp else [])]
-    )
-    try:
-        os.chdir(prob_dir_str)
-        yield
-    finally:
-        os.chdir(old_cwd)
-        with contextlib.suppress(ValueError):
-            sys.path.remove(prob_dir_str)
-        if old_pp is None:
-            os.environ.pop("PYTHONPATH", None)
-        else:
-            os.environ["PYTHONPATH"] = old_pp
+    with _import_lock:
         _purge_problem_modules()
+        sys.path.insert(0, prob_dir_str)
+        os.environ["PYTHONPATH"] = os.pathsep.join(
+            [prob_dir_str, *(old_pp.split(os.pathsep) if old_pp else [])]
+        )
+        try:
+            os.chdir(prob_dir_str)
+            yield
+        finally:
+            os.chdir(old_cwd)
+            with contextlib.suppress(ValueError):
+                sys.path.remove(prob_dir_str)
+            if old_pp is None:
+                os.environ.pop("PYTHONPATH", None)
+            else:
+                os.environ["PYTHONPATH"] = old_pp
+            _purge_problem_modules()
 
 
 def do_bench(
@@ -267,10 +226,9 @@ class _GeneratorAdapter:
         self._gen = gen
 
     def __call__(self, **kwargs: Any) -> Any:
-
         inputs, expected = self._gen(**kwargs)
         output = expected[0].new_empty(expected[0].size())
-        return (output, *tuple(inputs)), expected
+        return (output, *inputs), expected
 
 
 def _shim_qualname(qualname: str, prob_dir: Path) -> tuple[str, Path]:
@@ -289,7 +247,8 @@ import {module_name} as _real
 _orig = _real.{func_name}
 def {func_name}(output, *args, **kwargs):
     result = _orig(*args, **kwargs)
-    output.copy_(result)
+    if result is not None and result is not output and hasattr(output, 'copy_'):
+        output.copy_(result)
     return output
 """)
     return f"{shim_mod}.{func_name}", shim_path
@@ -309,35 +268,26 @@ def median_us(pygpubench: Any, result: Any) -> float | None:
 
 
 @contextlib.contextmanager
-def _gpu_env(gpu_index: int) -> Generator[None, None, None]:
+def _gpu_env(gpu_pool: list[int]) -> Generator[None, None, None]:
     """Arrange serialized GPU access for pygpubench's isolated subprocess.
 
     The kernel never runs in this process -- ``pygpubench.do_bench_isolated``
     forks a sandboxed worker to run it. We hand that worker the ``libktgpu.so``
-    LD_PRELOAD shim: on its first CUDA call it flocks a card from the pool and
-    holds it for the worker's (short) lifetime, releasing on exit. This is the
-    same per-UUID flock agents take through the shim, so orchestrator scoring and
-    agent commands serialize on one inode -- with no in-process lock to deadlock
-    against (a lock held here would collide with the shim's flock on the same
-    file).
+    LD_PRELOAD shim together with ``gpu_pool``: on its first CUDA call the shim
+    probes the pool for a free card (non-blocking), blocking on the first only if
+    every card is busy, flocks it, and holds it for the worker's (short) lifetime.
+    This is the same per-UUID flock agents take through the shim, so all GPU work
+    serializes on one inode -- with no in-process lock to deadlock against.
 
-    The pool is pinned to just ``gpu_index`` unless an outer shim already set one
-    (an agent running ``kernelthing score`` -- let its full-pool shim choose).
-    ``CUDA_VISIBLE_DEVICES`` is blanked (fail-closed); the shim pins the locked
-    card's UUID. If the shim isn't built, fall back to pinning the index.
+    An outer shim's pool wins (an agent running ``kernelthing score`` -- let its
+    full pool probe). ``CUDA_VISIBLE_DEVICES`` is blanked (fail-closed); the shim
+    pins the locked card's UUID. If the shim isn't built, fall back to pinning the
+    first pool index directly.
     """
     keys = ("CUDA_VISIBLE_DEVICES", "LD_PRELOAD", "KERNELTHING_GPU_POOL")
     saved = {k: os.environ.get(k) for k in keys}
     with _env_lock:
-        if _GPU_SHIM.exists():
-            os.environ["CUDA_VISIBLE_DEVICES"] = ""
-            if not os.environ.get("KERNELTHING_GPU_POOL"):
-                os.environ["KERNELTHING_GPU_POOL"] = gpulock.gpu_pool_spec([gpu_index])
-            prev = saved["LD_PRELOAD"] or ""
-            if str(_GPU_SHIM) not in prev.split(":"):
-                os.environ["LD_PRELOAD"] = f"{_GPU_SHIM}:{prev}" if prev else str(_GPU_SHIM)
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+        gpulock.apply_shim_env(os.environ, gpu_pool, overwrite_pool=False)
         try:
             yield
         finally:
@@ -408,18 +358,19 @@ def derive_metric(
 
 
 def measure_baseline(
-    problem: Problem, worktree: Path, *, gpu_index: int = 0
+    problem: Problem, worktree: Path, *, gpu_index: int = 0, gpu_pool: list[int] | None = None
 ) -> tuple[float | None, str | None]:
     """Benchmark the baseline reference kernel once, returning ``(median_us, err)``."""
+    pool = gpu_pool if gpu_pool is not None else [gpu_index]
     try:
-        with _gpu_env(gpu_index):
-            return _measure_baseline_impl(problem, worktree, gpu_index)
+        with _gpu_env(pool):
+            return _measure_baseline_impl(problem, worktree)
     except Exception as e:
         return None, explain_bench_error(e)
 
 
 def _measure_baseline_impl(
-    problem: Problem, worktree: Path, gpu_index: int
+    problem: Problem, worktree: Path
 ) -> tuple[float | None, str | None]:
     """Body of ``measure_baseline`` — runs inside ``_gpu_env``."""
     try:
@@ -460,34 +411,119 @@ def _measure_baseline_impl(
         return None, explain_bench_error(e)
 
 
-def warm_build(problem: Problem, worktree: Path, *, timeout: int = 60) -> None:
-    """Trigger compilation of the worktree's kernel in a subprocess outside the GPU
-    lock, so the real benchmark only pays runtime, not compile time.
+def _sweep_stale_batons(build_root: Path) -> None:
+    """Delete orphaned torch ``file_baton`` lock files under *build_root*.
 
-    Runs ``python -c 'import submission'`` inside the problem dir with
-    ``CUDA_VISIBLE_DEVICES=""`` — enough to force ``torch.utils.cpp_extension.load``
-    to compile and cache the ``.so``, but the import itself will fail when the
-    kernel launch is actually attempted (no GPU visible). That is fine: the build
-    artifacts survive and the real pygpubench benchmark reuses them.
+    ``torch.utils.cpp_extension`` guards each build directory with a ``FileBaton``
+    (``torch/utils/file_baton.py``): ``try_acquire`` creates ``<dir>/lock`` with
+    ``O_EXCL`` and only ``release`` removes it. A compiler killed mid-build (a
+    timeout, OOM, or crash) never releases, so the lock file is orphaned -- and
+    every later import that would compile that extension spins **forever** in
+    ``FileBaton.wait()`` (it has no timeout and no liveness check).
 
-    Best-effort: if the subprocess fails or times out the caller proceeds anyway
-    and the real benchmark just compiles in-line.
+    Call this only while holding ``_compile_lock`` for the same tree: that flock
+    guarantees no live kernelthing compiler is using these directories, so any
+    ``lock`` present is provably stale and safe to remove.
+    """
+    with contextlib.suppress(OSError):
+        for lock in build_root.rglob("lock"):
+            with contextlib.suppress(OSError):
+                lock.unlink()
+
+
+@contextlib.contextmanager
+def _compile_lock(prob_dir: Path) -> Generator[None, None, None]:
+    """Crash-safe exclusive lock over *prob_dir*'s build tree.
+
+    Uses ``fcntl.flock`` -- released automatically by the kernel when the fd is
+    closed or the holding process dies -- so a compiler killed mid-build can never
+    wedge the next build, the crash-safety torch's ``O_EXCL`` file_baton lacks.
+    This is what lets ``_sweep_stale_batons`` delete a stale baton without racing a
+    live compiler: while we hold this flock, no other kernelthing build is running
+    in the tree. Best-effort -- if the lock can't be taken we proceed unlocked
+    rather than block scoring.
+    """
+    build_root = prob_dir / "build"
+    with contextlib.suppress(OSError):
+        build_root.mkdir(parents=True, exist_ok=True)
+    lf = None
+    try:
+        with contextlib.suppress(OSError):
+            lf = open(build_root / ".kt-compile.lock", "w")  # noqa: SIM115 (held across yield for the flock)
+            fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
+    finally:
+        if lf is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(lf, fcntl.LOCK_UN)
+            lf.close()
+
+
+def warm_build(problem: Problem, worktree: Path, *, timeout: int | None = None, arch: str = "") -> None:
+    """Compile the worktree's kernels in a subprocess outside the GPU lock, so the
+    real benchmark only pays runtime, not compile time.
+
+    Runs ``import task, submission`` inside the problem dir to force
+    ``torch.utils.cpp_extension`` to build and cache both the reference kernel
+    (``task`` imports ``baseline``, which the sandboxed worker also compiles when
+    it generates test cases) and the submission kernel. The build is pure host-side
+    ``nvcc``/``cicc`` and must stay *off* the GPU lock; the real pygpubench worker
+    then reuses the cached ``.so``s and pays only runtime. ``task`` is imported
+    first so the fixed reference still warms even when a broken submission fails to
+    compile.
+
+    Crash-safe compile coordination (the ``file_baton`` fix): the build is wrapped
+    in ``_compile_lock`` (an ``fcntl.flock`` released on process death) and any
+    orphaned torch baton lock is swept first (``_sweep_stale_batons``). Together
+    these replace torch's non-crash-safe ``O_EXCL`` file_baton -- a compiler killed
+    mid-build can no longer wedge later builds in ``FileBaton.wait()``. Because this
+    completes the build off-lock, the GPU-locked worker finds an up-to-date ``.so``
+    and never touches the baton at all, so its own timeout-kill can't orphan one.
+
+    The env is set so the build cannot touch the GPU or its lock:
+      * ``TORCH_CUDA_ARCH_LIST`` (``arch``, e.g. ``"8.9"``) makes ``cpp_extension``
+        pick gencode flags from the string instead of calling
+        ``get_device_capability()`` — so the compile makes no CUDA call at all
+        (inherited from the environment when ``arch`` is empty).
+      * ``LD_PRELOAD`` / ``KERNELTHING_GPU_POOL`` are stripped so the libktgpu
+        shim isn't even loaded here — the build physically cannot flock a card
+        even if some import path did touch CUDA.
+      * ``CUDA_VISIBLE_DEVICES=""`` — no device visible.
+
+    ``timeout`` is ``None`` by default: the compile runs to completion off-lock (a
+    bounded stall on the caller, which has *not* taken the GPU lock yet). The old
+    fixed cap silently ``SIGKILL``ed slow ``nvcc`` builds mid-compile, orphaning a
+    baton and forcing the *next* build to recompile under the GPU lock -- the exact
+    stall this function exists to prevent. Best-effort otherwise: on any failure the
+    caller proceeds and the real benchmark just compiles in-line.
     """
     prob_dir = Path(worktree) / problem.rel_dir
     if not prob_dir.is_dir():
         return
-    with contextlib.suppress(Exception):
-        subprocess.run(
-            [sys.executable, "-c", "import submission"],
-            cwd=str(prob_dir),
-            capture_output=True,
-            timeout=timeout,
-            env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
-        )
+    env = {k: v for k, v in os.environ.items() if k != "LD_PRELOAD"}
+    env.pop("KERNELTHING_GPU_POOL", None)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    if arch:
+        env["TORCH_CUDA_ARCH_LIST"] = arch
+    with _compile_lock(prob_dir):
+        _sweep_stale_batons(prob_dir / "build")
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                [sys.executable, "-c", "import task, submission"],
+                cwd=str(prob_dir),
+                capture_output=True,
+                timeout=timeout,
+                env=env,
+            )
 
 
 def score(
-    problem: Problem, worktree: Path, *, baseline_median: float | None = None, gpu_index: int = 0
+    problem: Problem,
+    worktree: Path,
+    *,
+    baseline_median: float | None = None,
+    gpu_index: int = 0,
+    gpu_pool: list[int] | None = None,
 ) -> tuple[bool, float | None, str | None]:
     """Benchmark the worktree's submission through pygpubench.
 
@@ -502,17 +538,19 @@ def score(
     re-benchmarked here -- the run measures it once (``measure_baseline``) and
     reuses it so every candidate is scored against one fixed baseline.
 
-    ``gpu_index``: set ``CUDA_VISIBLE_DEVICES`` for the pygpubench subprocess.
+    ``gpu_pool`` (or a single ``gpu_index``): candidate cards handed to the shim,
+    which probes them for a free one and flocks it for the worker's lifetime.
     """
+    pool = gpu_pool if gpu_pool is not None else [gpu_index]
     try:
-        with _gpu_env(gpu_index):
-            return _score_impl(problem, worktree, baseline_median, gpu_index)
+        with _gpu_env(pool):
+            return _score_impl(problem, worktree, baseline_median)
     except Exception as e:
         return False, None, explain_bench_error(e)
 
 
 def _score_impl(
-    problem: Problem, worktree: Path, baseline_median: float | None, gpu_index: int
+    problem: Problem, worktree: Path, baseline_median: float | None
 ) -> tuple[bool, float | None, str | None]:
     """Body of ``score`` — runs inside ``_gpu_env`` so torch sees the GPU at import time."""
     try:

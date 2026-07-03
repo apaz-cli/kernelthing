@@ -29,14 +29,14 @@ class Problem:
     rel_dir: str  # problem dir, relative to repo_root
     plan: str  # repo-relative path to the plan
     edit_files: list[str]  # repo-relative paths the agent may edit
-    # Plain score command (cwd = <worktree>/<rel_dir>), used only when pygpubench
-    # scoring is turned off (cfg.pygpubench=False); pygpubench problems may leave
-    # it empty or point it at a self-test the agent runs.
+    # Plain score command (cwd = <worktree>/<rel_dir>), used as the agent's
+    # self-test command; the authoritative scoring always goes through pygpubench.
+    # Problems may set it to a custom check or leave it empty (the loop fills in
+    # ``kernelthing score .`` for the agent).
     score_command: str = ""
     metric_name: str = "metric"
     unit: str = ""
     direction: str = "maximize"  # or "minimize"
-    bench_runs: int = 3
     # Expected GPU model name (matched against nvidia-smi --query-gpu=name).
     # Empty means "no restriction" — pre-existing or hand-authored problems
     # are allowed to run on any GPU. The bootstrap process fills this in
@@ -88,7 +88,6 @@ def load_problem(path: str | Path) -> Problem:
         metric_name=data.get("metric_name", "metric"),
         unit=data.get("unit", ""),
         direction=data.get("direction", "maximize"),
-        bench_runs=int(data.get("bench_runs", 3)),
         gpu=data.get("gpu", ""),
         bench=dict(data.get("bench", {})),
         metric=dict(data.get("metric", {})),

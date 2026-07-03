@@ -199,31 +199,6 @@ svg { display: block; width: 100% }
 }
 .agent .ln.tool { color: var(--exploit) }
 
-/* niche bars */
-.niche { margin-bottom: 7px }
-.niche .lbl {
-  display: flex;
-  justify-content: space-between;
-  font-size: 12px;
-  margin-bottom: 2px;
-}
-.niche .lbl .s {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 70%;
-}
-.track {
-  background: var(--line2);
-  border-radius: 3px;
-  height: 8px;
-  overflow: hidden;
-}
-.fill {
-  height: 100%;
-  background: linear-gradient(90deg, #1f6feb, var(--exploit));
-}
-
 /* lineage */
 #lineageCard { display: flex; flex-direction: column }
 #lineage {
@@ -304,12 +279,8 @@ svg { display: block; width: 100% }
     <div id=agents></div>
   </div>
 
-  <div class=row>
-    <div class=card id=nichesCard><h2>Niches <span class=sub>best kernel per commit message</span></h2>
-      <div id=niches></div></div>
-    <div class=card id=lineageCard><h2>Lineage <span class=sub>parent → child mutations</span></h2>
-      <div id=lineage></div></div>
-  </div>
+  <div class=card id=lineageCard><h2>Lineage <span class=sub>parent → child mutations</span></h2>
+    <div id=lineage></div></div>
 
   <div class=card id=lbCard><h2>Leaderboard</h2>
     <table><thead><tr><th>#</th><th>mem</th><th class=num>metric</th><th>op</th><th>message</th>

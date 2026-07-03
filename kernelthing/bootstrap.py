@@ -103,10 +103,9 @@ def validate_problem(target: Path, *, gpu_index: int = 0) -> tuple[bool, str | N
             f"{sorted(clash)} (only the kernel source is editable)",
             problem,
         )
-    if not bench.available():
-        return True, "pygpubench not installed -- skipping runtime validation", problem
-    with gpulock.gpu_lock(gpu_index):
-        correct, _metric, err = bench.score(problem, problem.repo_root, gpu_index=gpu_index)
+    # GPU access is serialized by the libktgpu.so shim inside pygpubench's
+    # isolated worker (see bench._gpu_env); no in-process lock needed.
+    correct, _metric, err = bench.score(problem, problem.repo_root, gpu_index=gpu_index)
     if not correct:
         return False, err or "shipped submission did not score correct", problem
     return True, None, problem

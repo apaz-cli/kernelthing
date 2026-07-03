@@ -10,6 +10,7 @@ stop flow through an optional LoopBus shared with the web UI.
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import shutil
@@ -19,10 +20,11 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
-from . import bench, evolve, gates, opencode_client, prompts
+from . import evolve, gates, opencode_client, prompts
 from .bus import LoopBus
 from .config import Config, format_duration
 from .problem import Problem
@@ -131,8 +133,7 @@ Self-test by running the scorer:
 It must report `"correct": true`. **Commit as soon as
 you have ANY correct improvement** (`git add -A && git commit -m "..."`) -- your
 last committed correct version is what gets scored, so a timeout never wastes the
-run. You may then attempt a bigger gain, keeping the first as a fallback. Do NOT
-edit anything outside {{EDIT_FILES}}.
+run. Do NOT edit anything outside {{EDIT_FILES}}.
 
 Write @candidate-summary.md with a brief description of the changes made -- 2-3
 sentences or short bullet points, with the final measured metric ({{UNIT}}).
@@ -241,12 +242,8 @@ class Orchestrator:
     def _score_cmd_str(self) -> str:
         """Absolute-path scoring command the agent can self-test with.
 
-        When pygpubench is on the problem's score_command is empty (the orchestrator
-        uses bench.score directly), but the agent still needs a working self-test
-        command. Construct one from the venv so the agent never has to discover
-        kernelthing on PATH.
-        """
-
+        Constructs one from the venv so the agent never has to discover kernelthing
+        on PATH. The problem's own ``score_command`` (if set) takes priority."""
         venv_bin = Path(sys.executable).parent
         kt = str(venv_bin / "kernelthing")
         if self.problem.score_command:
@@ -262,15 +259,18 @@ class Orchestrator:
             "EDIT_FILES": ", ".join(self.problem.edit_files),
             "SCORE_CMD": self._score_cmd_str(),
             "UNIT": self.problem.unit or self.problem.metric_name,
-            "KERNEL_TOOLS": self._kernel_tools_block(),
         }
 
+    @cached_property
     def _kernel_tools_block(self) -> str:
         """Assemble the optional kernel-domain tool guidance (KDA skills) appended
         to implementer prompts. Each part is included only when its flag is on;
         with both off this returns '' (no section). Absolute paths into the
         kernelthing install's ``vendor/`` are used -- the whole filesystem is
         read-only-bound in the sandbox, so they resolve from any worktree.
+
+        Cached: every input (cfg flags, ``sys.executable``, ``REPO_ROOT``) is
+        fixed for the run, so the block is built once instead of per candidate.
         """
         from .config import REPO_ROOT
 
@@ -394,57 +394,69 @@ class Orchestrator:
             self.impl_session = res.session_id
         return res
 
+    def _cli_score(
+        self,
+        wt: Path,
+        gpu_index: int,
+        *,
+        baseline_median: float | None = None,
+        emit_baseline: bool = False,
+    ) -> tuple[bool, float | None, str | None, float | None]:
+        """Score a worktree by shelling out to ``kernelthing score`` and parsing its
+        JSON. Runs the *same* code path agents use, and -- crucially -- in its own
+        process, so concurrent scorings never race on the shared in-process import
+        state (``bench._importable`` mutates ``sys.path``/``sys.modules``/cwd).
+
+        Returns ``(correct, metric, err, baseline_median)``; the last is populated
+        only when ``emit_baseline`` is set (so the seed can pin it for later scores).
+        GPU exclusivity is handled inside the subprocess by the libktgpu shim.
+        """
+        prob_dir = wt / self.problem.rel_dir
+        cmd = [
+            sys.executable, "-m", "kernelthing", "score", str(prob_dir),
+            "--gpu", str(gpu_index), "--override-gpu",
+        ]
+        if emit_baseline:
+            cmd.append("--emit-baseline")
+        elif baseline_median is not None:
+            cmd += ["--baseline-median", repr(baseline_median)]
+        try:
+            r = subprocess.run(
+                cmd, cwd=str(prob_dir), capture_output=True, text=True, timeout=1800
+            )
+        except subprocess.TimeoutExpired:
+            return False, None, "score timeout", None
+        line = next(
+            (ln.strip() for ln in reversed(r.stdout.splitlines()) if ln.strip().startswith("{")),
+            "",
+        )
+        if not line:
+            return False, None, (r.stderr.strip()[-500:] or "score emitted no JSON"), None
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            return False, None, "score emitted no parseable JSON", None
+        return bool(d.get("correct")), d.get("metric"), d.get("error"), d.get("baseline_median")
+
     def _score_worktree(
         self, wt: Path, *, gpu_index: int = 0
     ) -> tuple[bool, float | None, str | None]:
         """Score the worktree, returning (correct, metric, err).
 
-        Default (cfg.pygpubench): delegate to the in-process adversarial benchmark
-        (bench.score), which owns its own repeats -- we do NOT loop it.
-        cfg.pygpubench off: run the problem's score command bench_runs times;
-        all_correct requires correct on every run (rejects flaky/racy
-        implementations); best_metric is the best observed across runs per the
-        problem's direction (robust to jitter).
+        Shells out to ``kernelthing score`` (one process per score -> no shared-state
+        race), pinning this GPU's baseline denominator.
         """
         baseline = self._baselines.get(gpu_index)
-        if self.cfg.pygpubench:
-            return bench.score(self.problem, wt, baseline_median=baseline, gpu_index=gpu_index)
-        cwd = wt / self.problem.rel_dir
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu_index))
-        all_correct, metrics, err = True, [], None
-        for _ in range(self.problem.bench_runs):
-            try:
-                r = subprocess.run(
-                    self.problem.score_command,
-                    shell=True,
-                    cwd=str(cwd),
-                    capture_output=True,
-                    text=True,
-                    env=env,
-                    timeout=900,
-                )
-            except subprocess.TimeoutExpired:
-                return False, None, "score timeout"
-            correct, metric = bench.parse_score(r.stdout)
-            if not correct:
-                all_correct = False
-            if metric is not None:
-                metrics.append(metric)
-            elif err is None:
-                err = "score emitted no parseable JSON"
-        if not metrics:
-            return False, None, err or "no metric"
-        best = max(metrics) if self.problem.direction == "maximize" else min(metrics)
-        return all_correct, best, None
+        correct, metric, err, _ = self._cli_score(wt, gpu_index, baseline_median=baseline)
+        return correct, metric, err
 
     def _guarded_score(
         self, wt: Path, *, gpu_index: int = 0
     ) -> tuple[bool, float | None, str | None]:
         """Run the cheap static cheat gate (kernelguard) BEFORE the expensive bench:
-        a detected cheat is disqualified outright and never scored. The kernel is
-        pre-compiled outside the GPU lock so the benchmark only pays runtime."""
-        if self.cfg.pygpubench:
-            bench.warm_build(self.problem, wt)
+        a detected cheat is disqualified outright and never scored. Scoring shells
+        out to ``kernelthing score`` (see ``_cli_score``), which warm-builds the
+        kernel off-lock itself, so the benchmark only pays runtime."""
         if self.cfg.kernelguard:
             cheats = gates.kernelguard_violations(
                 self.problem.edit_files,
@@ -487,7 +499,7 @@ class Orchestrator:
                 **common,
             )
         return (
-            body + prompts.render(EVOLVE_DESCRIPTOR_FOOTER, **common) + str(common["KERNEL_TOOLS"])
+            body + prompts.render(EVOLVE_DESCRIPTOR_FOOTER, **common) + self._kernel_tools_block
         )
 
     def _evolve_task(
@@ -563,7 +575,9 @@ class Orchestrator:
         every operator falls back to explore (forking the base) until one works.
 
         Baselines are measured on every GPU in the pool so each device gets its own
-        pinned denominator for pct_baseline/speedup metrics.
+        pinned denominator for pct_baseline/speedup metrics. Scoring shells out to
+        ``kernelthing score`` (see ``_cli_score``) once per GPU -- each in its own
+        process, so nothing races on shared in-process import state.
         """
         m = evolve.Member(id=pop.next_id(), operator="seed", commit=base, commit_message="baseline")
         seed_gpu = self._default_gpu()
@@ -571,32 +585,32 @@ class Orchestrator:
         with self._git_lock:
             gates.git(["worktree", "add", "--detach", "--force", str(wt), base], self.wd)
         try:
-            # GPU access is serialized by the libktgpu.so shim inside pygpubench's
-            # isolated worker (see bench._gpu_env) -- no in-process flock needed.
-            if self.cfg.pygpubench:
-                bl, berr = bench.measure_baseline(self.problem, wt, gpu_index=seed_gpu)
-                if berr:
-                    self._log(
-                        f"baseline pin failed on GPU {seed_gpu} ({berr}); "
-                        "falling back to per-candidate baseline"
-                    )
-                elif bl is not None:
-                    self._baselines[seed_gpu] = bl
-                    self._log(
-                        f"GPU {seed_gpu} baseline pinned: {bl:.1f}us (= 100%, fixed for the run)"
-                    )
-            m.correct, m.metric, m.error = self._score_worktree(wt, gpu_index=seed_gpu)
-            # Measure baselines on the remaining GPUs in the pool.
+            if self.cfg.kernelguard:
+                cheats = gates.kernelguard_violations(
+                    self.problem.edit_files,
+                    wt,
+                    profile=self.cfg.kernelguard_profile,
+                    metadata={"problem_name": self.problem.name},
+                )
+                if cheats:
+                    m.error = "kernelguard: " + ", ".join(x["file"] for x in cheats)
+                    return m
+
+            # Score the seed and pin each GPU's baseline denominator by shelling out
+            # to `kernelthing score --emit-baseline`, once per GPU. Each score is its
+            # own process, so there is no shared-state race.
             for gpu in self._gpu_indices:
+                correct, metric, err, bl = self._cli_score(wt, gpu, emit_baseline=True)
                 if gpu == seed_gpu:
-                    continue
-                if self.cfg.pygpubench:
-                    bl, berr = bench.measure_baseline(self.problem, wt, gpu_index=gpu)
-                    if berr:
-                        self._log(f"GPU {gpu} baseline pin failed ({berr})")
-                    elif bl is not None:
-                        self._baselines[gpu] = bl
-                        self._log(f"GPU {gpu} baseline pinned: {bl:.1f}us")
+                    m.correct, m.metric, m.error = correct, metric, err
+                if bl is not None:
+                    self._baselines[gpu] = bl
+                    self._log(
+                        f"GPU {gpu} baseline pinned: {bl:.1f}us"
+                        + (" (= 100%, fixed for the run)" if gpu == seed_gpu else "")
+                    )
+                elif err:
+                    self._log(f"GPU {gpu} baseline pin failed ({err})")
         finally:
             with self._git_lock:
                 gates.git(["worktree", "remove", "--force", str(wt)], self.wd)
@@ -860,7 +874,7 @@ class Orchestrator:
                 + (f" [{best.commit_message[:50]}]" if best.commit_message else "")
                 + " to HEAD"
             )
-            self._persist_best(best)
+            self._copy_best_kernel()
         else:
             self._log("evolve: no viable kernel found; HEAD unchanged")
         self._evolve_cleanup(state, pop, wt_root)
@@ -893,20 +907,21 @@ class Orchestrator:
         self._log(f"persisted best kernel to {out}")
         return out
 
-    def _persist_best(self, best: evolve.Member) -> None:
-        """Copy the best kernel to a stable path that survives managed-repo wipes."""
-        self._copy_best_kernel()
-
     def persist_current_head(self) -> None:
         """Copy whatever kernel is at HEAD to the stable best-kernel path.
 
         Called on KeyboardInterrupt so a killed run still saves the last promoted
-        kernel, not just a clean exit."""
+        kernel, not just a clean exit. Best-effort; swallows all errors."""
         try:
             head = self._git(["rev-parse", "HEAD"])
         except Exception:
             return
-        if head == getattr(self, "_base_commit", ""):
+        base = getattr(self, "_base_commit", "")
+        if base and head == base:
+            self._log("interrupted: HEAD unchanged from baseline, nothing to persist")
+            return
+        if not base:
+            self._log("interrupted before seed scoring, nothing to persist")
             return
         self._copy_best_kernel()
 

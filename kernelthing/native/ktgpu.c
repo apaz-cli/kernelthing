@@ -35,10 +35,12 @@
 #include <unistd.h>
 
 #define KT_POOL_ENV "KERNELTHING_GPU_POOL"
+#define KT_HELD_ENV "KERNELTHING_GPU_HELD"
 #define KT_MAX_UUID 128
 
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
-static int g_lock_fd = -1;             /* held open for process lifetime */
+static int g_lock_fd = -1;             /* held open for process lifetime (-1 if inherited) */
+static int g_acquired = 0;             /* resolved a card: own flock OR inherited from ancestor */
 static char g_uuid[KT_MAX_UUID] = {0}; /* chosen device UUID, for diagnostics */
 
 /* Try to claim one lockfile. Returns an open, flock-held fd or -1.
@@ -58,7 +60,24 @@ static int kt_try_lock(const char *path, int block) {
  * Idempotent-safe to call once (guarded by pthread_once in the hooks). Exposed
  * (non-static) so the test harness can drive it without a real CUDA install. */
 int ktgpu_acquire(void) {
-  if (g_lock_fd >= 0) return 0; /* already holding a card */
+  if (g_acquired) return 0; /* already resolved a card for this process */
+
+  /* Re-entrancy across a process subtree: if an ancestor already flocked a card
+   * (it exports the UUID in KERNELTHING_GPU_HELD, inherited through exec), adopt
+   * that same card instead of taking a *second* flock. This is essential because
+   * pygpubench/torch run the real GPU work in a spawned child: the parent that
+   * first touches CUDA (e.g. torch's device-capability probe when building)
+   * holds the lock for the whole subtree, so on a single-card pool the child
+   * would otherwise deadlock waiting on a card its own parent is holding. We
+   * don't hold an fd here -- the ancestor's fd keeps the flock alive. */
+  const char *held = getenv(KT_HELD_ENV);
+  if (held && *held) {
+    snprintf(g_uuid, sizeof(g_uuid), "%s", held);
+    setenv("CUDA_VISIBLE_DEVICES", held, 1);
+    g_acquired = 1;
+    return 0;
+  }
+
   const char *pool = getenv(KT_POOL_ENV);
   if (!pool || !*pool) return -1; /* no pool configured -> fail open (no-op) */
 
@@ -82,8 +101,10 @@ int ktgpu_acquire(void) {
     int fd = kt_try_lock(path, 0);
     if (fd >= 0) {
       g_lock_fd = fd;
+      g_acquired = 1;
       snprintf(g_uuid, sizeof(g_uuid), "%s", uuid);
       setenv("CUDA_VISIBLE_DEVICES", uuid, 1);
+      setenv(KT_HELD_ENV, uuid, 1); /* descendants adopt this card, don't re-lock */
       free(buf);
       return 0;
     }
@@ -94,8 +115,10 @@ int ktgpu_acquire(void) {
     int fd = kt_try_lock(first_path, 1);
     if (fd >= 0) {
       g_lock_fd = fd;
+      g_acquired = 1;
       snprintf(g_uuid, sizeof(g_uuid), "%s", first_uuid);
       setenv("CUDA_VISIBLE_DEVICES", first_uuid, 1);
+      setenv(KT_HELD_ENV, first_uuid, 1); /* descendants adopt this card, don't re-lock */
       free(buf);
       return 0;
     }
@@ -108,14 +131,23 @@ int ktgpu_acquire(void) {
 static void kt_acquire_once(void) { (void)ktgpu_acquire(); }
 static void kt_ensure(void) { pthread_once(&g_once, kt_acquire_once); }
 
-/* Runs at library load, before main() and before any CUDA call. If a pool is
- * configured, neutralize any CUDA_VISIBLE_DEVICES inherited from the launching
- * command (e.g. an agent trying `CUDA_VISIBLE_DEVICES=0 python ...` to dodge the
- * lock): blank it so no device is reachable until ktgpu_acquire() pins the one
- * card we locked. This closes the window where CUDA might read the agent-set
- * value before our first hooked call fires. When no pool is configured the shim
- * is inert and leaves the environment untouched. */
+/* Runs at library load, before main() and before any CUDA call.
+ *
+ * If an ancestor already holds a card (KERNELTHING_GPU_HELD inherited through
+ * exec), pin CUDA_VISIBLE_DEVICES to it right away so this process sees that one
+ * card even before its first hooked call fires.
+ *
+ * Otherwise, if a pool is configured, neutralize any CUDA_VISIBLE_DEVICES
+ * inherited from the launching command (e.g. an agent trying
+ * `CUDA_VISIBLE_DEVICES=0 python ...` to dodge the lock): blank it so no device
+ * is reachable until ktgpu_acquire() pins the one card we lock. When no pool is
+ * configured the shim is inert and leaves the environment untouched. */
 __attribute__((constructor)) static void kt_init(void) {
+  const char *held = getenv(KT_HELD_ENV);
+  if (held && *held) {
+    setenv("CUDA_VISIBLE_DEVICES", held, 1);
+    return;
+  }
   const char *pool = getenv(KT_POOL_ENV);
   if (pool && *pool) setenv("CUDA_VISIBLE_DEVICES", "", 1);
 }

@@ -1,10 +1,10 @@
 """Tests for the problem-bootstrap flow (kernelthing/bootstrap.py).
 
 opencode/pygpubench/a GPU are not available in CI, so the setup agent is replaced
-by a fake ``opencode_client.run`` that authors a complete problem dir, and runtime
-validation fails open (``bench.available()`` -> False). This exercises the real
-control flow: slug/dir derivation, the SETUP_BLOCKED and auto-without-objective
-guards, manifest validation, and the git commit of the new dir.
+by a fake ``opencode_client.run`` that authors a complete problem dir, and the
+runtime GPU validation is stubbed out. This exercises the real control flow:
+slug/dir derivation, the SETUP_BLOCKED and auto-without-objective guards, manifest
+validation, and the git commit of the new dir.
 """
 
 import subprocess
@@ -92,8 +92,8 @@ def _fake_run(text, *, author=True, **author_kw):
 
 @pytest.fixture
 def no_runtime_validation(monkeypatch):
-    # Fail open: no pygpubench installed -> skip the GPU correctness check.
-    monkeypatch.setattr(bootstrap.bench, "available", lambda: False)
+    # No GPU in CI: stub bench.score to return a passing result.
+    monkeypatch.setattr(bootstrap.bench, "score", lambda problem, worktree, **kw: (True, 1.0, None))
 
 
 # --- behavior ---

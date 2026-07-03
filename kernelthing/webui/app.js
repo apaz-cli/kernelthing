@@ -69,15 +69,13 @@ async function poll() {
     if (MODE === 'evolve') {
       $('sbCard').classList.add('hidden');
       $('agentsCard').classList.remove('hidden');
-      $('nichesCard').classList.remove('hidden');
       $('lineageCard').classList.remove('hidden');
       $('lbCard').classList.remove('hidden');
       const mem = s.members || [];
-      drawChart(mem); drawAgents(agents); drawNiches(mem); drawLineage(mem); drawLeaderboard(mem);
+      drawChart(mem); drawAgents(agents); drawLineage(mem); drawLeaderboard(mem);
     } else {
       $('sbCard').classList.remove('hidden');
       $('agentsCard').classList.add('hidden');
-      $('nichesCard').classList.add('hidden');
       $('lineageCard').classList.add('hidden');
       $('lbCard').classList.add('hidden');
       drawScoreboard(s.scoreboard || []);
@@ -161,32 +159,6 @@ function drawAgents(agents) {
       <div class=top><span class="${opClass(a.op)}">${a.op}</span>
         <span class=id>mem ${a.id}</span><span class=meta>${par}</span></div>
       <div class=meta>⚙ ${a.tools || 0} tools${cost}</div>${tool}${text}</div>`;
-  }).join('');
-}
-
-/* ---------- Niches: best viable member per commit message ---------- */
-function drawNiches(mem) {
-  const grid = {};
-  for (const m of mem) {
-    if (!m.correct || m.metric == null) continue;
-    const k = m.message || 'uncategorized';
-    const g = grid[k];
-    if (!g || better(m.metric, g.metric)) {
-      grid[k] = {...m, count: (g ? g.count : 0) + 1};
-    } else {
-      g.count++;
-    }
-  }
-  const list = Object.values(grid).sort((a, b) => better(a.metric, b.metric) ? -1 : 1);
-  if (!list.length) { $('niches').innerHTML = '<div class=muted>no niches yet</div>'; return; }
-  const ms = list.map(n => n.metric);
-  const lo = Math.min(...ms), hi = Math.max(...ms);
-  $('niches').innerHTML = list.map(n => {
-    const w = hi === lo ? 100 : Math.max(6, (DIR === 'maximize' ? (n.metric - lo) / (hi - lo) : (hi - n.metric) / (hi - lo)) * 100);
-    const lbl = n.message || 'uncategorized';
-    return `<div class=niche><div class=lbl><span class=s title="${esc(lbl)}">${esc(lbl)}</span>
-      <span class=good>${fmt(n.metric)} <span class=muted>×${n.count}</span></span></div>
-      <div class=track><div class=fill style=width:${w}%></div></div></div>`;
   }).join('');
 }
 

@@ -16,6 +16,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from . import bootstrap
 from .bus import LoopBus
@@ -164,15 +165,17 @@ def run_loop(args: argparse.Namespace) -> int:
         kernelguard=not args.no_kernelguard,
         ncu=not args.no_ncu,
         wiki=not args.no_wiki,
-        pygpubench=not args.no_pygpubench,
         auto_setup=args.auto_setup,
         max_candidates=args.max_candidates,
         wall_clock_s=args.wall_clock,
         elite_k=args.elite_k,
+        min_niches=args.min_niches,
         problem_root=args.problem_root,
     )
 
     from . import gpulock
+
+    gpulock.warm_cache(gpus)
 
     if not args.override_gpu:
         arch_warning = gpulock.check_architecture_mismatch(gpus)
@@ -237,9 +240,9 @@ def score_command(argv: list[str]) -> int:
     """``kernelthing score [<dir>]``: run the authoritative scorer on a problem dir
     and print its JSON verdict.
 
-    This is the *same* ``bench.score`` call that gates bootstrap (``validate_problem``) and
-    every loop round -- so a green here means the problem (or a kernel edit) scores
-    correct for real, with no bespoke self-test harness to drift out of sync.
+    This is the *same* ``bench.score`` call that gates bootstrap
+    (``validate_problem``) and every loop round -- so a green here means the
+    problem (or a kernel edit) scores correct for real.
 
     ``--gpu N`` (repeatable) picks the GPU; without it, any free GPU of the same
     model as the default device (``CUDA_VISIBLE_DEVICES``/GPU 0) is used, falling
@@ -272,6 +275,10 @@ def score_command(argv: list[str]) -> int:
         help=argparse.SUPPRESS,
         default=False,
     )
+    # Orchestrator-internal (used by Orchestrator._cli_score); hidden from agents,
+    # who only ever run bare `kernelthing score .`.
+    p.add_argument("--baseline-median", type=float, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--emit-baseline", action="store_true", default=False, help=argparse.SUPPRESS)
     args = p.parse_args(argv)
 
     try:
@@ -287,22 +294,40 @@ def score_command(argv: list[str]) -> int:
             return 2
 
     if args.gpu:
-        gpu = gpulock.pick_free_gpu(preferred=args.gpu)
+        pool = gpulock.candidate_gpus(preferred=args.gpu)
+    elif problem.gpu:
+        pool = gpulock.candidate_gpus(model=problem.gpu)
     else:
-        if problem.gpu:
-            gpu = gpulock.pick_free_gpu(model=problem.gpu)
-        else:
-            default_index = default_gpu()[0]
-            gpu = gpulock.pick_free_gpu(
-                model=gpulock.gpu_name(default_index),
-                arch=gpulock.gpu_architecture(default_index),
-            )
+        default_index = default_gpu()[0]
+        pool = gpulock.candidate_gpus(
+            model=gpulock.gpu_name(default_index),
+            arch=gpulock.gpu_architecture(default_index),
+        )
+    # Compile the kernel off-lock first (pure host-side nvcc, no GPU): the shimmed
+    # pygpubench worker then reuses the cached .so instead of compiling while
+    # holding the card, so the lock covers only the actual run.
+    bench.warm_build(problem, problem.repo_root, arch=gpulock.torch_arch_list(pool))
+
+    # Baseline denominator for pct_baseline/speedup: pin the one passed in, or (with
+    # --emit-baseline) measure it once here and report it so the caller can pin it
+    # on subsequent scores. Both run sequentially in this single process, so there
+    # is no shared-state race -- unlike scoring concurrently in threads.
+    result: dict[str, Any] = {"unit": problem.unit}
+    baseline_median = args.baseline_median
+    if args.emit_baseline and baseline_median is None:
+        baseline_median, berr = bench.measure_baseline(problem, problem.repo_root, gpu_pool=pool)
+        result["baseline_median"] = baseline_median
+        if berr:
+            print(json.dumps({**result, "correct": False, "metric": None, "error": berr}))
+            return 1
     # GPU access is serialized inside bench.score: it hands pygpubench's isolated
-    # worker the libktgpu.so LD_PRELOAD shim, which flocks a card for that worker's
-    # lifetime. No in-process flock here -- taking one would deadlock against the
-    # shim's flock on the same lockfile.
-    correct, metric, err = bench.score(problem, problem.repo_root, gpu_index=gpu)
-    result = {"correct": correct, "metric": metric, "unit": problem.unit, "error": err}
+    # worker the libktgpu.so LD_PRELOAD shim together with this candidate pool. The
+    # shim probes the pool for a free card and flocks it for the worker's lifetime.
+    # No in-process flock here -- taking one would deadlock against the shim's.
+    correct, metric, err = bench.score(
+        problem, problem.repo_root, gpu_pool=pool, baseline_median=baseline_median
+    )
+    result.update({"correct": correct, "metric": metric, "error": err})
     print(json.dumps(result))
     return 0 if correct else 1
 
@@ -346,6 +371,13 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=4,
         help="size of the top-K frontier (the exploit pool). Default 4.",
+    )
+    search.add_argument(
+        "--min-niches",
+        type=int,
+        default=4,
+        help="below this many strategy niches, bias toward explore "
+        "to fill out the diversity grid. Default 4.",
     )
     search.add_argument(
         "-m",
@@ -411,12 +443,6 @@ def main(argv: list[str] | None = None) -> int:
         "--no-wiki",
         action="store_true",
         help="don't offer the agent the KernelWiki kernel-optimization knowledge base",
-    )
-    tools.add_argument(
-        "--no-pygpubench",
-        action="store_true",
-        help="score with the problem's plain score_command instead of the "
-        "pygpubench adversarial sandboxed benchmark (debug / no-torch boxes)",
     )
 
     web = parser.add_argument_group("web UI")

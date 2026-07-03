@@ -3,8 +3,8 @@
 Zero dependencies: a ThreadingHTTPServer in a daemon thread serves a single HTML
 page that polls ``/api/status`` and renders the live evolutionary search -- a
 fitness chart (best vs. kernels submitted), the in-flight agents (each streaming
-its exact tool calls), the MAP-Elites niches, the lineage tree, and a
-leaderboard. Shares a :class:`LoopBus` with the loop.
+its exact tool calls), the lineage tree, and a leaderboard. Shares a
+:class:`LoopBus` with the loop.
 
 The agents stream for free: every opencode turn writes its NDJSON event log to a
 per-agent file *as it arrives*. The controller can't see inside a running turn
