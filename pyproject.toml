@@ -6,6 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "kernelthing"
 version = "0.1.0"
 description = "Autonomous evolutionary GPU-kernel optimization loop driving the opencode agent."
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{ name = "Aaron Pazdera", email = "aarpazdera@gmail.com" }]
 requires-python = ">=3.11"
 
 # The ``opencode`` CLI (and Node, for the guard plugin) are external prerequisites,
@@ -20,6 +23,9 @@ dependencies = [
 # pygpubench (+ torch) is the DEFAULT scoring engine (kernelthing/bench.py
 # runs each kernel in pygpubench's adversarial, sandboxed subprocess).
 # ``--no-pygpubench`` bypasses it for command-scored problems.
+[project.urls]
+GitHub = "https://github.com/apaz-cli/kernelthing"
+
 [project.optional-dependencies]
 # Test / development tooling.
 dev = ["pytest", "ruff>=0.11.0", "mypy>=1.14"]
