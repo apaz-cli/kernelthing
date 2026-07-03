@@ -1,14 +1,16 @@
 from pathlib import Path
 
-from kernelthing.state import LoopDirs, State, load_state, new_timestamp, save_state
+from kernelthing.state import LoopDirs, State, new_timestamp, save_state
 
 
 def _make_state(ts: str) -> State:
     return State(
-        timestamp=ts, plan_file="examples/gemm/plan.md",
+        timestamp=ts,
+        plan_file="examples/gemm/plan.md",
         model="deepseek/deepseek-v4-pro",
-        start_branch="main", base_branch="main", base_commit="abc1234",
-        current_round=3, mainline_stall_count=2, last_mainline_verdict="stalled",
+        start_branch="main",
+        base_branch="main",
+        base_commit="abc1234",
     )
 
 
@@ -24,7 +26,7 @@ def test_state_from_json_ignores_unknown_keys():
     s = _make_state(ts)
     blob = s.to_json().rstrip().rstrip("}") + ', "future_field": 99}'
     s2 = State.from_json(blob)
-    assert s2.current_round == 3
+    assert s2.start_branch == "main"
 
 
 def test_save_and_load(tmp_path: Path):
@@ -33,13 +35,13 @@ def test_save_and_load(tmp_path: Path):
     s = _make_state(ts)
     save_state(dirs, s)
     assert dirs.state_file.is_file()
-    assert load_state(dirs) == s
+    loaded = State.from_json(dirs.state_file.read_text(encoding="utf-8"))
+    assert loaded == s
 
 
 def test_loopdirs_artifact_names(tmp_path: Path):
     ts = "2026-06-04_00-00-00"
     d = LoopDirs(tmp_path, ts)
     assert d.summary(2).name == "round-2-summary.md"
-    assert d.review_result(0).name == "round-0-review-result.md"
-    assert d.contract(5).name == "round-5-contract.md"
+    assert d.prompt(3).name == "round-3-prompt.md"
     assert str(d.base).endswith(f".humanize/rlcr/{ts}")

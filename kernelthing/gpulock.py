@@ -19,6 +19,7 @@ the device. The lockfile lives in the system temp dir; the orchestrator binds it
 into each agent's bubblewrap sandbox at the same path (see ``sandbox.wrap``) so
 the inode -- and therefore the lock -- is shared across the sandbox boundary.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -28,9 +29,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Generator
 from pathlib import Path
 
 _UUID_CACHE: dict[int, str] = {}
+_ARCH_CACHE: dict[int, str] = {}
 
 
 def gpu_uuid(index: int) -> str:
@@ -49,7 +52,10 @@ def gpu_uuid(index: int) -> str:
         with contextlib.suppress(Exception):
             out = subprocess.run(
                 [smi, f"--id={index}", "--query-gpu=uuid", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=10)
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
             if out.returncode == 0:
                 val = out.stdout.strip().splitlines()
                 if val and val[0].strip():
@@ -58,7 +64,7 @@ def gpu_uuid(index: int) -> str:
     return uuid
 
 
-def _slug(uuid: str) -> str:
+def slug(uuid: str) -> str:
     return re.sub(r"[^A-Za-z0-9-]", "", uuid) or "unknown"
 
 
@@ -70,14 +76,94 @@ def lock_path(index: int) -> Path:
     opens the same file. The empty file is created on first request (bwrap needs
     the bind source to exist before it can mount it into a sandbox).
     """
-    p = Path(tempfile.gettempdir()) / f"kt-gpu-{_slug(gpu_uuid(index))}.lock"
+    p = Path(tempfile.gettempdir()) / f"kt-gpu-{slug(gpu_uuid(index))}.lock"
     with contextlib.suppress(OSError):
         p.touch(exist_ok=True)
     return p
 
 
+def gpu_architecture(index: int) -> str:
+    """SM compute capability string for CUDA device *index* (e.g. ``"sm_90"``, ``"sm_120"``).
+
+    Queried once per index via ``nvidia-smi`` and cached. Any failure degrades to
+    ``"unknown"``; the caller can still proceed (the user has been warned).
+    """
+    if index in _ARCH_CACHE:
+        return _ARCH_CACHE[index]
+    arch = "unknown"
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        with contextlib.suppress(Exception):
+            out = subprocess.run(
+                [smi, f"--id={index}", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if out.returncode == 0:
+                val = out.stdout.strip().splitlines()
+                if val and val[0].strip():
+                    cc = val[0].strip()
+                    major, minor = cc.split(".") if "." in cc else (cc, "0")
+                    arch = f"sm_{major}{minor}"
+    _ARCH_CACHE[index] = arch
+    return arch
+
+
+def gpu_name(index: int) -> str:
+    """Human-readable GPU product name for CUDA device *index*. Cached, best-effort."""
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        return f"GPU {index}"
+    with contextlib.suppress(Exception):
+        out = subprocess.run(
+            [smi, f"--id={index}", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if out.returncode == 0:
+            val = out.stdout.strip().splitlines()
+            if val and val[0].strip():
+                return val[0].strip()
+    return f"GPU {index}"
+
+
+def check_architecture_mismatch(indices: list[int]) -> str | None:
+    """If the given GPU indices have mixed SM architectures, return a warning
+    message suitable for display. Returns ``None`` when homogeneous or information
+    is unavailable.
+
+    Mixed architectures mean the same compiled kernel (PTX/SASS) may not be valid
+    on all devices and absolute timing comparisons across GPUs are meaningless.
+    """
+    if len(indices) <= 1:
+        return None
+    arches: dict[str, list[int]] = {}
+    for i in indices:
+        a = gpu_architecture(i)
+        arches.setdefault(a, []).append(i)
+    if len(arches) <= 1:
+        return None
+    lines = [
+        "",
+        "=" * 72,
+        "WARNING: GPU architecture mismatch detected!",
+        "Different GPUs may not run the same compiled kernel correctly, and",
+        "absolute performance comparisons across architectures are not valid.",
+        "",
+    ]
+    for arch, idxs in sorted(arches.items()):
+        names = [f"  GPU {j} ({gpu_name(j)}, {arch})" for j in idxs]
+        lines.extend(names)
+    lines.append("")
+    lines.append("Proceed only if you understand these implications.")
+    lines.append("=" * 72)
+    return "\n".join(lines)
+
+
 @contextlib.contextmanager
-def gpu_lock(index: int):
+def gpu_lock(index: int) -> Generator[Path, None, None]:
     """Hold an exclusive flock on GPU *index* for the duration of the block.
 
     Blocking: waits until no other process (an agent's build/run/profile or

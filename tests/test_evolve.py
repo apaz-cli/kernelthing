@@ -1,4 +1,5 @@
 """Unit tests for the pure evolutionary-search logic (kernelthing/evolve.py)."""
+
 import random
 
 from kernelthing import evolve
@@ -6,14 +7,20 @@ from kernelthing.evolve import Member, Population
 
 
 def _viable(pop, *, metric, message="", commit="c"):
-    m = Member(id=pop.next_id(), operator=evolve.OP_EXPLORE,
-               commit=commit or f"c{metric}", commit_message=message,
-               metric=metric, correct=True)
+    m = Member(
+        id=pop.next_id(),
+        operator=evolve.OP_EXPLORE,
+        commit=commit or f"c{metric}",
+        commit_message=message,
+        metric=metric,
+        correct=True,
+    )
     pop.insert(m)
     return m
 
 
 # --- viability + frontier ---
+
 
 def test_member_viability_requires_correct_commit_and_metric():
     assert not Member(id=0, operator="x").viable
@@ -59,6 +66,7 @@ def test_status_classification():
 
 # --- niches (commit-message derived) ---
 
+
 def test_niches_keep_best_per_message():
     pop = Population()
     _viable(pop, metric=10, message="add tiling")
@@ -78,18 +86,27 @@ def test_niche_key_from_commit_message():
 
 # --- operator selection ---
 
+
 def test_choose_operator_forces_explore_without_elites():
     rng = random.Random(0)
-    op = evolve.choose_operator(rng, {evolve.OP_EXPLOIT: 1.0},
-                                have_elites=False, n_niches=0, min_niches=4)
+    op = evolve.choose_operator(
+        rng, {evolve.OP_EXPLOIT: 1.0}, have_elites=False, n_niches=0, min_niches=4
+    )
     assert op == evolve.OP_EXPLORE
 
 
 def test_choose_operator_respects_weights():
     rng = random.Random(1)
-    ops = [evolve.choose_operator(
-        rng, {evolve.OP_EXPLORE: 1.0, evolve.OP_EXPLOIT: 0.0},
-        have_elites=True, n_niches=10, min_niches=4) for _ in range(20)]
+    ops = [
+        evolve.choose_operator(
+            rng,
+            {evolve.OP_EXPLORE: 1.0, evolve.OP_EXPLOIT: 0.0},
+            have_elites=True,
+            n_niches=10,
+            min_niches=4,
+        )
+        for _ in range(20)
+    ]
     assert set(ops) == {evolve.OP_EXPLORE}
 
 
@@ -98,14 +115,21 @@ def test_choose_operator_double_explore_when_underpopulated():
     # With equal weights but 0 niches (under min_niches=4), explore is doubled
     seen = set()
     for _ in range(100):
-        seen.add(evolve.choose_operator(
-            rng, {evolve.OP_EXPLORE: 0.5, evolve.OP_EXPLOIT: 0.5},
-            have_elites=True, n_niches=0, min_niches=4))
+        seen.add(
+            evolve.choose_operator(
+                rng,
+                {evolve.OP_EXPLORE: 0.5, evolve.OP_EXPLOIT: 0.5},
+                have_elites=True,
+                n_niches=0,
+                min_niches=4,
+            )
+        )
     # Both operators are possible but explore should dominate (2:1 odds)
     assert "explore" in seen
 
 
 # --- parent selection / bandit ---
+
 
 def test_select_parent_explore_returns_viable_member():
     pop = Population()
@@ -126,8 +150,8 @@ def test_select_parent_explore_favors_unvisited():
     pop = Population()
     a = _viable(pop, metric=10, message="a")
     b = _viable(pop, metric=30, message="b")
-    a.children = 10   # heavily visited
-    b.children = 0    # untouched
+    a.children = 10  # heavily visited
+    b.children = 0  # untouched
     # b should be picked far more often
     rng = random.Random(42)
     counts = {a.id: 0, b.id: 0}

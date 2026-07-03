@@ -21,6 +21,7 @@ lineages with the best metric via a UCB-style bandit whose visit count includes
 in-flight children (virtual loss), so concurrent dispatch does not pile onto a
 single arm before its results land.
 """
+
 from __future__ import annotations
 
 import math
@@ -33,9 +34,9 @@ OP_EXPLORE = "explore"
 OP_EXPLOIT = "exploit"
 
 # member status (for display / classification)
-ST_ELITE = "elite"    # viable and on the top-K frontier
-ST_LIVE = "live"      # viable, retained, parent-able
-ST_DEAD = "dead"      # not viable (incorrect / no commit / no metric)
+ST_ELITE = "elite"  # viable and on the top-K frontier
+ST_LIVE = "live"  # viable, retained, parent-able
+ST_DEAD = "dead"  # not viable (incorrect / no commit / no metric)
 
 
 @dataclass
@@ -46,12 +47,12 @@ class Member:
     operator: str
     parent_id: int | None = None
     commit: str | None = None
-    commit_message: str = ""       # first line of the git commit (human-readable, used for niche key)
+    commit_message: str = ""  # first line of the git commit (human-readable, used for niche key)
     metric: float | None = None
     correct: bool = False
-    summary_text: str = ""         # raw candidate-summary.md (for human debugging)
+    summary_text: str = ""  # raw candidate-summary.md (for human debugging)
     error: str | None = None
-    children: int = 0              # tasks dispatched from this member (bandit visits)
+    children: int = 0  # tasks dispatched from this member (bandit visits)
     status: str = ST_DEAD
 
     @property
@@ -72,15 +73,11 @@ class Task:
     member_id: int
     operator: str
     parent_id: int | None
-    parent_commit: str | None    # None -> fork the base
+    parent_commit: str | None  # None -> fork the base
     prompt: str
 
 
-def _better(a: float, b: float, direction: str) -> bool:
-    return a > b if direction == "maximize" else a < b
-
-
-def _norm(values: list[float], direction: str) -> list[float]:
+def norm(values: list[float], direction: str) -> list[float]:
     """Scale ``values`` to [0, 1] with higher = better (direction-aware)."""
     if not values:
         return []
@@ -94,25 +91,26 @@ def _norm(values: list[float], direction: str) -> list[float]:
     return out
 
 
-def _bandit_weights(pool: list[Member], direction: str, in_flight: dict[int, int],
-                    c: float) -> dict[int, float]:
+def bandit_weights(
+    pool: list[Member], direction: str, in_flight: dict[int, int], c: float
+) -> dict[int, float]:
     """UCB-style weight per member: exploitation (normalized metric) + exploration
     (``c * sqrt(ln(total_visits+1)/(visits+1))``), divided by ``1 + in_flight`` so
     concurrent dispatch spreads across arms (virtual loss)."""
     vals = [float(m.metric) for m in pool if m.metric is not None]
     if not vals:
         return {m.id: 1e-9 for m in pool}
-    norms = _norm(vals, direction)
+    norms = norm(vals, direction)
     total = sum(m.children for m in pool)
     weights: dict[int, float] = {}
-    for m, nv in zip(pool, norms):
+    for m, nv in zip(pool, norms, strict=True):
         explore = c * math.sqrt(math.log(total + 1) / (m.children + 1))
         w = (nv + explore) / (1 + in_flight.get(m.id, 0))
         weights[m.id] = max(w, 1e-9)
     return weights
 
 
-def _weighted_pick(pool: list[Member], weights: dict[int, float], rng: random.Random) -> Member:
+def weighted_pick(pool: list[Member], weights: dict[int, float], rng: random.Random) -> Member:
     total = sum(weights[m.id] for m in pool)
     r = rng.random() * total
     acc = 0.0
@@ -126,8 +124,7 @@ def _weighted_pick(pool: list[Member], weights: dict[int, float], rng: random.Ra
 class Population:
     """The live archive of scored kernels + frontier/niche bookkeeping."""
 
-    def __init__(self, *, direction: str = "maximize",
-                 elite_k: int = 4, ucb_c: float = 0.7):
+    def __init__(self, *, direction: str = "maximize", elite_k: int = 4, ucb_c: float = 0.7):
         self.direction = direction
         self.elite_k = elite_k
         self.ucb_c = ucb_c
@@ -160,7 +157,7 @@ class Population:
     def niches(self) -> dict[str, Member]:
         """Best viable member per niche key (commit-message derived)."""
         grid: dict[str, Member] = {}
-        for m in self._viable_sorted():   # best-first, so first seen per key wins
+        for m in self._viable_sorted():  # best-first, so first seen per key wins
             grid.setdefault(m.niche_key(), m)
         return grid
 
@@ -171,8 +168,9 @@ class Population:
             m.status = ST_ELITE
 
     # --- parent selection (bandit with virtual loss) ---
-    def select_parent(self, operator: str, rng: random.Random,
-                      in_flight: dict[int, int]) -> Member | None:
+    def select_parent(
+        self, operator: str, rng: random.Random, in_flight: dict[int, int]
+    ) -> Member | None:
         if operator == OP_EXPLOIT:
             pool = self.elites()
         elif operator == OP_EXPLORE:
@@ -190,14 +188,19 @@ class Population:
             for m in pool:
                 w = math.sqrt(math.log(total + 1) / (m.children + 1))
                 weights[m.id] = max(w / (1 + in_flight.get(m.id, 0)), 1e-9)
-            return _weighted_pick(pool, weights, rng)
-        weights = _bandit_weights(pool, self.direction, in_flight, self.ucb_c)
-        return _weighted_pick(pool, weights, rng)
+            return weighted_pick(pool, weights, rng)
+        weights = bandit_weights(pool, self.direction, in_flight, self.ucb_c)
+        return weighted_pick(pool, weights, rng)
 
 
-def choose_operator(rng: random.Random, weights: dict[str, float], *,
-                    have_elites: bool, n_niches: int,
-                    min_niches: int) -> str:
+def choose_operator(
+    rng: random.Random,
+    weights: dict[str, float],
+    *,
+    have_elites: bool,
+    n_niches: int,
+    min_niches: int,
+) -> str:
     """Pick an operator. Forces ``explore`` until a viable elite exists and doubles
     the ``explore`` weight while the niche grid is under-populated."""
     if not have_elites:

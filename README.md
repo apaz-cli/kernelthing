@@ -11,8 +11,6 @@ is rather different and has many more features.
 
 ![kernelthing in action](images/kernel_autoresearch_run.png)
 
-<br>
-
 ## Setup
 
 ```bash

@@ -18,6 +18,7 @@ Two modes mirror the loop's interactivity flags:
 The result is always a *complete* problem dir, committed so the loop's worktrees
 branch from it; the orchestrator therefore does no further spec setup.
 """
+
 from __future__ import annotations
 
 import json
@@ -28,7 +29,7 @@ from pathlib import Path
 
 from . import bench, gates, gpulock, opencode_client, prompts
 from .config import MARKER_COMPLETE, MARKER_SETUP_BLOCKED, Config
-from .problem import Problem, _git_toplevel, load_problem
+from .problem import Problem, git_toplevel, load_problem
 from .state import new_timestamp
 
 
@@ -39,7 +40,7 @@ def slugify(text: str, *, max_words: int = 5) -> str:
     return slug or f"problem-{new_timestamp()}"
 
 
-def _unique_dir(problems_root: Path, slug: str) -> Path:
+def unique_dir(problems_root: Path, slug: str) -> Path:
     """``problems_root/slug``, suffixed ``-2``, ``-3`` ... if it already exists."""
     candidate = problems_root / slug
     n = 2
@@ -51,10 +52,10 @@ def _unique_dir(problems_root: Path, slug: str) -> Path:
 
 def repo_root_for_cwd() -> Path:
     """The enclosing git toplevel of the current directory (where problems/ lives)."""
-    return _git_toplevel(Path.cwd())
+    return git_toplevel(Path.cwd())
 
 
-def _protected_files(problem: Problem) -> set[str]:
+def protected_files(problem: Problem) -> set[str]:
     """Basenames the optimizer must never edit: the adapter module that exposes
     ``submission_qualname`` plus the objective spec (``task.py`` / ``baseline.py``).
 
@@ -64,14 +65,14 @@ def _protected_files(problem: Problem) -> set[str]:
     """
     bench_cfg = problem.bench or {}
     metric = problem.metric or {}
-    mods = {bench_cfg["task_module"] if "task_module" in bench_cfg else "task"}
+    mods = {bench_cfg.get("task_module", "task")}
     for q in (bench_cfg.get("submission_qualname"), metric.get("baseline_qualname")):
         if q:
             mods.add(q.split(".", 1)[0])
     return {f"{m}.py" for m in mods if m}
 
 
-def _validate(target: Path) -> tuple[bool, str | None, Problem | None]:
+def validate_problem(target: Path) -> tuple[bool, str | None, Problem | None]:
     """Runtime validation: a loadable manifest whose shipped submission scores correct.
 
     Fails open when pygpubench/torch are not installed (ok=True with a note) -- the
@@ -93,11 +94,15 @@ def _validate(target: Path) -> tuple[bool, str | None, Problem | None]:
     # Reward-hacking guard: the optimizer may only edit the kernel source, never the
     # adapter (which exposes submission_qualname) or the objective spec (task.py /
     # baseline.py) -- editing those lets it bypass or fake the real computation.
-    forbidden = _protected_files(problem)
+    forbidden = protected_files(problem)
     clash = {Path(f).name for f in problem.edit_files} & forbidden
     if clash:
-        return (False, f"edit_files must not include the adapter/spec files "
-                f"{sorted(clash)} (only the kernel source is editable)", problem)
+        return (
+            False,
+            f"edit_files must not include the adapter/spec files "
+            f"{sorted(clash)} (only the kernel source is editable)",
+            problem,
+        )
     if not bench.available():
         return True, "pygpubench not installed -- skipping runtime validation", problem
     correct, _metric, err = bench.score(problem, problem.repo_root)
@@ -106,21 +111,21 @@ def _validate(target: Path) -> tuple[bool, str | None, Problem | None]:
     return True, None, problem
 
 
-def _render_prompt(objective: str | None, target: Path, repo_root: Path, *,
-                   auto: bool) -> str:
+def render_prompt(objective: str | None, target: Path, repo_root: Path, *, auto: bool) -> str:
     # The bootstrap prompt is mode-aware: autonomous (--auto-setup) has no operator
     # to converse with, interactive does. Render the matching directive's own
     # markers first, then inject it -- the main render is single-pass and does not
     # rescan inserted values, so {{COMPLETE}} inside the directive must already be
     # resolved.
-    mode_file = ("claude/bootstrap-mode-auto.md" if auto
-                 else "claude/bootstrap-mode-interactive.md")
+    mode_file = "claude/bootstrap-mode-auto.md" if auto else "claude/bootstrap-mode-interactive.md"
     mode_directive = prompts.load_and_render_safe(
-        mode_file, "",
-        COMPLETE=MARKER_COMPLETE, SETUP_BLOCKED=MARKER_SETUP_BLOCKED)
+        mode_file, "", COMPLETE=MARKER_COMPLETE, SETUP_BLOCKED=MARKER_SETUP_BLOCKED
+    )
     return prompts.load_and_render_safe(
-        "claude/bootstrap-problem.md", "",
-        OBJECTIVE=objective.strip() if objective and objective.strip()
+        "claude/bootstrap-problem.md",
+        "",
+        OBJECTIVE=objective.strip()
+        if objective and objective.strip()
         else "(none given yet -- ask the operator, who is in this session with you, now)",
         TARGET_DIR=str(target.relative_to(repo_root)),
         MODE_DIRECTIVE=mode_directive,
@@ -137,15 +142,16 @@ PROMPT_SNAPSHOT = "bootstrap-prompt.md"
 PROMPT_META = ".bootstrap-meta.json"
 
 
-def write_bootstrap_prompt(target: Path, repo_root: Path, objective: str | None,
-                           *, auto: bool) -> str:
+def write_bootstrap_prompt(
+    target: Path, repo_root: Path, objective: str | None, *, auto: bool
+) -> str:
     """Render the bootstrap prompt from the current template and write it (plus the
     inputs to re-render it later) into the problem dir. Returns the rendered text."""
-    prompt = _render_prompt(objective, target, repo_root, auto=auto)
+    prompt = render_prompt(objective, target, repo_root, auto=auto)
     (target / PROMPT_SNAPSHOT).write_text(prompt, encoding="utf-8")
     (target / PROMPT_META).write_text(
-        json.dumps({"objective": objective or "", "auto": bool(auto)}),
-        encoding="utf-8")
+        json.dumps({"objective": objective or "", "auto": bool(auto)}), encoding="utf-8"
+    )
     return prompt
 
 
@@ -173,23 +179,22 @@ def refresh_bootstrap_prompt(target: Path, repo_root: Path) -> bool:
         except (ValueError, OSError):
             pass
     try:
-        prompt = _render_prompt(objective, target, repo_root, auto=auto)
+        prompt = render_prompt(objective, target, repo_root, auto=auto)
         (target / PROMPT_SNAPSHOT).write_text(prompt, encoding="utf-8")
     except OSError:
         return False
     return True
 
 
-def _print_summary(target: Path, ok: bool, note: str | None) -> None:
+def print_summary(target: Path, ok: bool, note: str | None) -> None:
     lines = ["", "-- Bootstrapped problem --", f"  dir: {target}"]
     manifest = target / "problem.json"
     lines.append(f"  manifest: {'present' if manifest.is_file() else 'MISSING'}")
-    lines.append(f"  validation: {'VALID' if ok else 'INVALID'}"
-                 + (f" -- {note}" if note else ""))
+    lines.append(f"  validation: {'VALID' if ok else 'INVALID'}" + (f" -- {note}" if note else ""))
     print("\n".join(lines), file=sys.stderr, flush=True)
 
 
-def _commit(target: Path, repo_root: Path) -> None:
+def commit_problem(target: Path, repo_root: Path) -> None:
     """Commit the new problem dir so the loop's worktrees branch from it."""
     if target != repo_root:
         rel = str(target.relative_to(repo_root))
@@ -200,28 +205,39 @@ def _commit(target: Path, repo_root: Path) -> None:
         gates.git(["commit", "-m", f"bootstrap: initialize problem {target.name}"], repo_root)
 
 
-def _interactive_bootstrap(target: Path, repo_root: Path, prompt: str, cfg: Config) -> None:
+def interactive_bootstrap(target: Path, repo_root: Path, prompt: str, cfg: Config) -> None:
     """Open the opencode TUI seeded with the bootstrap prompt and converse to author
     the problem, then validate + ``(a)pprove / (e)dit more / (q)uit`` in a loop."""
     if not sys.stdin.isatty():
-        raise RuntimeError("bootstrap: no problem dir and no tty for an interactive "
-                           "session -- pass a problem dir, or use --auto-setup with an "
-                           "objective")
+        raise RuntimeError(
+            "bootstrap: no problem dir and no tty for an interactive "
+            "session -- pass a problem dir, or use --auto-setup with an "
+            "objective"
+        )
     first = True
     while True:
         # First pass: launch the TUI with the bootstrap prompt so the agent greets the
         # operator and authors files live. Later passes: resume that session (-c) so
         # follow-up edits keep full context.
         opencode_client.run_interactive(
-            working_dir=repo_root, model=cfg.model,
-            prompt=prompt if first else None, continue_last=not first,
-            gpu_index=cfg.gpu_index, writable=True, sandboxed=cfg.sandbox, ncu=cfg.ncu,
-            gpu_lock=gpulock.lock_path(cfg.gpu_index))
+            working_dir=repo_root,
+            model=cfg.model,
+            prompt=prompt if first else None,
+            continue_last=not first,
+            gpu_index=cfg.gpu_indices[0],
+            writable=True,
+            sandboxed=cfg.sandbox,
+            ncu=cfg.ncu,
+            gpu_lock=gpulock.lock_path(cfg.gpu_indices[0]),
+        )
         first = False
-        ok, note, _ = _validate(target)
-        _print_summary(target, ok, note)
-        question = ("(a)pprove, (e)dit more, or (q)uit? [a/e/q] " if ok
-                    else "problem is not valid yet -- (e)dit more or (q)uit? [e/q] ")
+        ok, note, _ = validate_problem(target)
+        print_summary(target, ok, note)
+        question = (
+            "(a)pprove, (e)dit more, or (q)uit? [a/e/q] "
+            if ok
+            else "problem is not valid yet -- (e)dit more or (q)uit? [e/q] "
+        )
         ans = input(f"\n[bootstrap] {question}").strip().lower()
         if ans in ("q", "quit"):
             raise RuntimeError("bootstrap aborted by user")
@@ -230,8 +246,9 @@ def _interactive_bootstrap(target: Path, repo_root: Path, prompt: str, cfg: Conf
         # otherwise loop back into the (resumed) session for more edits
 
 
-def bootstrap_problem(objective: str | None, *, cfg: Config, auto: bool,
-                      managed_root: Path) -> Path:
+def bootstrap_problem(
+    objective: str | None, *, cfg: Config, auto: bool, managed_root: Path
+) -> Path:
     """Author a new problem dir and return its path. See module docstring for modes.
 
     The problem is authored directly inside a standalone git repo at
@@ -242,48 +259,59 @@ def bootstrap_problem(objective: str | None, *, cfg: Config, auto: bool,
     failed in auto mode, or the operator quit the review).
     """
     if auto and not (objective and objective.strip()):
-        raise RuntimeError("bootstrap: --auto-setup needs an objective "
-                           "(pass it as the argument or via --objective-file)")
+        raise RuntimeError(
+            "bootstrap: --auto-setup needs an objective "
+            "(pass it as the argument or via --objective-file)"
+        )
 
-    repo_root = _unique_dir(managed_root, slugify(objective or ""))
+    repo_root = unique_dir(managed_root, slugify(objective or ""))
     repo_root.mkdir(parents=True, exist_ok=True)
     target = repo_root  # the problem IS the repo root
 
     # Init a standalone git repo so worktrees branch from committed state.
-    subprocess.run(["git", "init", "-b", "main"], cwd=target, check=True,
-                   capture_output=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=target, check=True, capture_output=True)
 
-    print(f"[bootstrap] authoring a new problem at {target} "
-          f"({'auto' if auto else 'interactive'})", file=sys.stderr)
+    print(
+        f"[bootstrap] authoring a new problem at {target} ({'auto' if auto else 'interactive'})",
+        file=sys.stderr,
+    )
 
     # Keep the bootstrap artifacts next to the problem for debugging, but out of the
     # commit (``git add <dir>`` honours this .gitignore for untracked files).
     (target / ".gitignore").write_text(
-        f"{PROMPT_SNAPSHOT}\n{PROMPT_META}\nbootstrap-opencode.log\n",
-        encoding="utf-8")
+        f"{PROMPT_SNAPSHOT}\n{PROMPT_META}\nbootstrap-opencode.log\n", encoding="utf-8"
+    )
 
     prompt = write_bootstrap_prompt(target, repo_root, objective, auto=auto)
 
     if auto:
         # No operator to converse with: run the agent headless and accept on validation.
         res = opencode_client.run(
-            prompt, working_dir=repo_root, model=cfg.model, session=None,
-            timeout=cfg.opencode_timeout, gpu_index=cfg.gpu_index,
-            writable=True, sandboxed=cfg.sandbox,
-            log_path=target / "bootstrap-opencode.log", ncu=cfg.ncu,
-            gpu_lock=gpulock.lock_path(cfg.gpu_index))
+            prompt,
+            working_dir=repo_root,
+            model=cfg.model,
+            session=None,
+            timeout=cfg.opencode_timeout,
+            gpu_index=cfg.gpu_indices[0],
+            writable=True,
+            sandboxed=cfg.sandbox,
+            log_path=target / "bootstrap-opencode.log",
+            ncu=cfg.ncu,
+            gpu_lock=gpulock.lock_path(cfg.gpu_indices[0]),
+        )
         if gates.has_setup_blocked(res.text):
-            raise RuntimeError("bootstrap: --auto-setup agent emitted SETUP_BLOCKED -- cannot "
-                               "author the problem from the given objective:\n"
-                               + res.text.strip()[-2000:])
-        ok, note, _ = _validate(target)
+            raise RuntimeError(
+                "bootstrap: --auto-setup agent emitted SETUP_BLOCKED -- cannot "
+                "author the problem from the given objective:\n" + res.text.strip()[-2000:]
+            )
+        ok, note, _ = validate_problem(target)
         if not ok:
             raise RuntimeError(f"bootstrap: --auto-setup validation failed: {note}")
         print("[bootstrap] problem validated; --auto-setup accepting", file=sys.stderr)
     else:
         # Drop the operator straight into the opencode TUI, seeded with the bootstrap
         # prompt, to describe the objective and author the files conversationally.
-        _interactive_bootstrap(target, repo_root, prompt, cfg)
+        interactive_bootstrap(target, repo_root, prompt, cfg)
 
-    _commit(target, repo_root)
+    commit_problem(target, repo_root)
     return target

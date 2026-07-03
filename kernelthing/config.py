@@ -1,7 +1,8 @@
 """Static configuration and constants."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -9,19 +10,8 @@ PROMPTS_DIR = REPO_ROOT / "prompts"
 
 # Sentinels (ported verbatim from Humanize loop semantics).
 MARKER_COMPLETE = "COMPLETE"
-MARKER_STOP = "STOP"
 # Emitted by the setup agent when it cannot derive the scoring objective.
 MARKER_SETUP_BLOCKED = "SETUP_BLOCKED"
-VERDICT_ADVANCED = "advanced"
-VERDICT_STALLED = "stalled"
-VERDICT_REGRESSED = "regressed"
-VERDICT_UNKNOWN = "unknown"
-DRIFT_NORMAL = "normal"
-DRIFT_REPLAN = "replan_required"
-
-# Consecutive STALLED/REGRESSED verdicts before forcing drift-recovery.
-DRIFT_STALL_THRESHOLD = 3
-MAX_FILE_LINES = 2000
 
 # Duration units for the wall-clock budget (``-w``), seconds per unit.
 DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
@@ -39,7 +29,7 @@ def parse_duration(text: str) -> int:
     value = float(s)
     if value < 0:
         raise ValueError(f"duration must be >= 0, got '{text}'")
-    return int(round(value * unit))
+    return round(value * unit)
 
 
 def format_duration(seconds: int) -> str:
@@ -59,43 +49,44 @@ class Config:
     """Run-time knobs for one loop invocation."""
 
     model: str = "deepseek/deepseek-v4-pro"
-    # ``-j``: max agents editing at once in the evolutionary search (the GPU
-    # benchmark stage stays serialized). Live-tunable down via the web UI.
-    parallelism: int = 4
-    max_candidates: int = 24      # dispatch budget; 0 = until wall-clock / stop
-    wall_clock_s: int = 0         # wall-clock budget in seconds; 0 = off
-    elite_k: int = 4              # size of the top-K frontier (the exploit pool)
-    min_niches: int = 4           # below this many strategy niches, bias to explore
-    # GPU exclusivity is enforced by a per-device flock (kernelthing/gpulock.py),
-    # not in-process state, so agents and the bench never share the card -- even
-    # across separate kernelthing processes on the same physical GPU.
-    evolve_seed: int = 0          # RNG seed for operator/parent sampling
-    op_explore: float = 0.5       # base operator-selection weights
-    op_exploit: float = 0.5
     opencode_timeout: int = 1200
-    gpu_index: int = 0
-    bitlesson_required: bool = True
-    methodology: bool = False
+
+    # --- search budget & shape ---
+    # ``-j``: max agents editing at once (the GPU benchmark stage stays serialized).
+    parallelism: int = 4
+    max_candidates: int = 24  # dispatch budget; 0 = until wall-clock / stop
+    wall_clock_s: int = 0  # wall-clock budget in seconds; 0 = off
+    elite_k: int = 4  # size of the top-K frontier (the exploit pool)
+    min_niches: int = 4  # below this many strategy niches, bias to explore
+    evolve_seed: int = 0  # RNG seed for operator/parent sampling
+
+    # --- GPU pool ---
+    # Pool of CUDA device indices the loop may use (--gpu 0 --gpu 1 / --gpu 0,1);
+    # tasks go to the least-busy device. Exclusivity is a per-device flock
+    # (kernelthing/gpulock.py), not in-process state, so agents and the bench never
+    # share a card -- even across separate kernelthing processes on the same GPU.
+    gpu_indices: list[int] = field(default_factory=lambda: [0])
+
+    # --- agent tools & sandboxing ---
     sandbox: bool = True
-    # pygpubench is the default benchmarking engine: every kernel is scored through
-    # its adversarial, sandboxed subprocess (kernelthing/bench.py). Turn it off to
-    # fall back to the problem's plain ``score_command`` (debug / no-torch boxes).
+    # pygpubench: default scoring engine (adversarial sandboxed subprocess,
+    # kernelthing/bench.py). Off -> fall back to the plain ``score_command``.
     pygpubench: bool = True
-    # Bootstrap phase (kernelthing/bootstrap.py): when launched without an existing
-    # problem dir, an agent authors one from the objective before the loop starts.
-    # auto_setup: build non-interactively and accept on validation pass (no review).
-    auto_setup: bool = False
-    # kernelguard cheat detection: scan the problem's edit files for
-    # benchmark-gaming patterns (timer monkeypatching, result/CUDA-graph replay,
-    # shape hardcoding, ...). On by default; rolls back / disqualifies cheaters.
+    # kernelguard: static cheat detection (timer monkeypatching, result/CUDA-graph
+    # replay, shape hardcoding, ...). On by default; disqualifies cheaters.
     kernelguard: bool = True
     kernelguard_profile: str = "default"
-    # Kernel-domain agent tooling (vendored KDA skills), injected into implementer
-    # prompts. ncu also binds the GPU perf-counter capability nodes in the sandbox.
+    # Vendored KDA skills injected into prompts; ncu also binds the GPU perf-counter
+    # capability nodes in the sandbox.
     ncu: bool = True
     wiki: bool = True
-    # Docs path handed to review prompts (relative to working dir).
-    docs_path: str = "docs"
-    # Managed problem repo root: problem dirs are copied into standalone git repos
-    # under this path so worktrees always branch from committed state.
+
+    # --- bootstrap / phases ---
+    # auto_setup: author the problem non-interactively, accept on validation pass.
+    auto_setup: bool = False
+    methodology: bool = False
+
+    # --- paths ---
+    # Managed repo root: problem dirs are copied into standalone git repos here so
+    # worktrees always branch from committed state.
     problem_root: Path = Path.home() / ".cache" / "kernelthing"

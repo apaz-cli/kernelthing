@@ -7,9 +7,9 @@ paths are re-bound writable on top. Network is left shared (the DeepSeek API
 needs it); the filesystem is the confinement boundary. The GPU device nodes are
 bound through so kernels can compile and run.
 """
+
 from __future__ import annotations
 
-import os
 import shutil
 from pathlib import Path
 
@@ -34,7 +34,7 @@ NVIDIA_CAPS_NODES = [
 # user-level skills (flywheel, prose-restructurer, etc.) load into the agent's
 # system prompt. The loop provides its own kernel-domain tooling via prompt
 # injection; user skills are pure noise.
-_SKILL_HOMES = [
+SKILL_HOMES = [
     Path.home() / ".claude" / "skills",
     Path.home() / ".agents" / "skills",
 ]
@@ -74,10 +74,15 @@ def wrap(
         "bwrap",
         "--die-with-parent",
         "--unshare-pid",
-        "--ro-bind", "/", "/",        # everything readable, nothing writable...
-        "--proc", "/proc",
-        "--dev", "/dev",              # fresh devtmpfs (null/zero/random/...)
-        "--tmpfs", "/tmp",
+        "--ro-bind",
+        "/",
+        "/",  # everything readable, nothing writable...
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",  # fresh devtmpfs (null/zero/random/...)
+        "--tmpfs",
+        "/tmp",
     ]
     # ...then re-bind the few writable paths on top.
     if writable:
@@ -101,7 +106,7 @@ def wrap(
         args += ["--bind", str(gpu_lock), str(gpu_lock)]
 
     # Mask skill directories so opencode loads no user-level skills.
-    for home in _SKILL_HOMES:
+    for home in SKILL_HOMES:
         if home.exists():
             args += ["--tmpfs", str(home)]
 

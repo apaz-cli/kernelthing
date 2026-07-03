@@ -5,6 +5,7 @@ Faithful port of Humanize's hooks/lib/template-loader.sh: single-pass
 ``{{OTHER}}`` appearing inside a value is left intact, preventing placeholder
 injection). Missing variables keep their ``{{NAME}}`` placeholder unchanged.
 """
+
 from __future__ import annotations
 
 import re
@@ -12,7 +13,7 @@ from pathlib import Path
 
 from .config import PROMPTS_DIR
 
-_VAR_RE = re.compile(r"\{\{([A-Z0-9_]+)\}\}")
+VAR_RE = re.compile(r"\{\{([A-Z0-9_]+)\}\}")
 
 
 def render(content: str, **variables: object) -> str:
@@ -26,7 +27,7 @@ def render(content: str, **variables: object) -> str:
 
     # re.sub with a function replaces in a single left-to-right pass and does
     # not rescan the inserted text -- matching the awk single-pass design.
-    return _VAR_RE.sub(_repl, content)
+    return VAR_RE.sub(_repl, content)
 
 
 def load(rel_path: str, prompts_dir: Path = PROMPTS_DIR) -> str:

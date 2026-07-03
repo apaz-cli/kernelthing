@@ -1,5 +1,6 @@
 """Web UI + bus tests: status flow, the lightweight loop_dir accessor, and the
 HTTP endpoints (including the candlog basename restriction)."""
+
 from __future__ import annotations
 
 import json
@@ -19,8 +20,14 @@ def test_bus_loop_dir_and_snapshot():
     assert bus.loop_dir() == "/tmp/x"
     snap = bus.snapshot()
     assert snap["round"] == 2
-    assert snap["control"] == {"parallelism": 3, "stop": False, "wall_clock_s": 0,
-                                "max_candidates": 0, "explore_bias": 50, "explore_auto": True}
+    assert snap["control"] == {
+        "parallelism": 3,
+        "stop": False,
+        "wall_clock_s": 0,
+        "max_candidates": 0,
+        "explore_bias": 50,
+        "explore_auto": True,
+    }
     assert snap["log"] == []
 
 
@@ -82,13 +89,16 @@ def _ndjson(*events: dict) -> str:
 
 def test_summarize_agent_log_extracts_tools_text_cost(tmp_path: Path):
     log = tmp_path / "mem-3-explore-opencode.log"
-    log.write_text(_ndjson(
-        {"type": "text", "part": {"text": "trying cp.async   staging"}},
-        {"type": "tool_use", "part": {"name": "bash", "input": {"command": "nvcc -O3 a.cu"}}},
-        {"type": "tool_use", "part": {"name": "edit", "input": {"filePath": "submission.py"}}},
-        {"type": "step_finish", "part": {"cost": 0.0123}},
-    ), encoding="utf-8")
-    s = webui._summarize_agent_log(log)
+    log.write_text(
+        _ndjson(
+            {"type": "text", "part": {"text": "trying cp.async   staging"}},
+            {"type": "tool_use", "part": {"name": "bash", "input": {"command": "nvcc -O3 a.cu"}}},
+            {"type": "tool_use", "part": {"name": "edit", "input": {"filePath": "submission.py"}}},
+            {"type": "step_finish", "part": {"cost": 0.0123}},
+        ),
+        encoding="utf-8",
+    )
+    s = webui.summarize_agent_log(log)
     assert s["tools"] == 2
     assert s["last_tool"] == "edit submission.py"
     assert s["last_text"] == "trying cp.async staging"
@@ -97,12 +107,17 @@ def test_summarize_agent_log_extracts_tools_text_cost(tmp_path: Path):
 
 def test_status_enriches_inflight_agents(server, tmp_path: Path):
     bus, port = server
-    (tmp_path / "mem-1-exploit-opencode.log").write_text(_ndjson(
-        {"type": "tool_use", "part": {"name": "bash", "input": {"command": "ncu ./a.out"}}},
-    ), encoding="utf-8")
-    bus.publish(loop_dir=str(tmp_path), mode="evolve",
-                agents=[{"id": 1, "op": "exploit", "parent": 0,
-                         "log_file": "mem-1-exploit-opencode.log"}])
+    (tmp_path / "mem-1-exploit-opencode.log").write_text(
+        _ndjson(
+            {"type": "tool_use", "part": {"name": "bash", "input": {"command": "ncu ./a.out"}}},
+        ),
+        encoding="utf-8",
+    )
+    bus.publish(
+        loop_dir=str(tmp_path),
+        mode="evolve",
+        agents=[{"id": 1, "op": "exploit", "parent": 0, "log_file": "mem-1-exploit-opencode.log"}],
+    )
     _, body = _get(port, "/api/status")
     agent = json.loads(body)["agents"][0]
     assert agent["tools"] == 1
@@ -114,7 +129,9 @@ def test_control_post(server):
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/api/control",
         data=json.dumps({"parallelism": 5, "stop": True}).encode(),
-        headers={"content-type": "application/json"}, method="POST")
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
     with urllib.request.urlopen(req) as r:
         assert json.loads(r.read())["ok"] is True
     assert bus.parallelism() == 5

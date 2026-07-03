@@ -7,6 +7,7 @@ the objective fitness comes from the problem's ``score`` command (JSON {correct,
 metric}); see problem.py and ``run()``. ``-j``/parallelism (agents at once) and
 stop flow through an optional LoopBus shared with the web UI.
 """
+
 from __future__ import annotations
 
 import os
@@ -17,7 +18,9 @@ import sys
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from . import bench, evolve, gates, gpulock, opencode_client, prompts
 from .bus import LoopBus
@@ -29,36 +32,25 @@ EXIT_COMPLETE = "complete"
 EXIT_MAXITER = "maxiter"
 EXIT_STOP = "stop"
 EXIT_ERROR = "error"
-EXIT_STALL = "stalled_out"   # several consecutive no-progress rounds; HEAD kept
-EXIT_STOPPED = "stopped"     # user requested stop via UI
+EXIT_STALL = "stalled_out"  # several consecutive no-progress rounds; HEAD kept
+EXIT_STOPPED = "stopped"  # user requested stop via UI
+
+
+@dataclass
+class RunContext:
+    """Mutable state owned by a single evolutionary-search invocation.
+
+    Separated from Orchestrator so the five closures that were tangled inside
+    ``run()`` are regular methods taking this as a parameter.
+    """
+
+    dispatched: int = 0
+    in_flight: dict[int, int] = field(default_factory=dict)
+    futures: dict[Any, Any] = field(default_factory=dict)
+    search_start: float | None = None
+
 
 # --- prompts (rendered with problem fields) ---
-
-GOAL_TRACKER_SEED = """# Goal Tracker
-
-## IMMUTABLE SECTION (set in Round 0)
-
-### Ultimate Goal
-[To be filled in Round 0 from the plan]
-
-### Acceptance Criteria
-[To be filled in Round 0 from the plan]
-
-## MUTABLE SECTION (updated every round)
-
-#### Active Tasks
-#### Completed and Verified
-#### Explicitly Deferred
-#### Blocking Side Issues
-#### Queued Side Issues
-#### Plan Evolution Log
-"""
-
-BITLESSON_SEED = """# BitLessons
-
-Project-specific, hard-won lessons. Each round summary records a
-`## BitLesson Delta` (Action: none|add|update).
-"""
 
 # Methodology Analysis phase (ported from Humanize; adapted for headless opencode
 # -- the Opus-subagent / AskUserQuestion / gh-issue flow is replaced by the agent
@@ -153,26 +145,21 @@ class Orchestrator:
         self.problem = problem
         self.wd = Path(problem.repo_root).resolve()
         self.cfg = cfg
-        # gpu_index is the single source of truth for which device everything runs
-        # on. Pin it on our own process env so the default pygpubench benchmark
-        # (bench.score -> pygpubench's subprocess, which only *inherits* env) lands
-        # on the same device as the agent turns and the legacy score_command, both
-        # of which already force CUDA_VISIBLE_DEVICES=gpu_index on their children.
-        # The loop targets exactly one device, so this is a single index.
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_index)
+        # Multi-GPU pool: track in-flight tasks per GPU index. The first GPU in
+        # the list is the "default" for operations (bootstrap, methodology) that
+        # only need one device. Dispatch picks the least-busy GPU.
+        self._gpu_indices = list(cfg.gpu_indices)
+        self._gpu_in_flight: dict[int, int] = dict.fromkeys(self._gpu_indices, 0)
         self.bus = bus
-        self.impl_session: str | None = None   # reused only by the methodology turn
-        self._history: list[dict] = []   # [{round: member_id, metric}] of viable members
+        self.impl_session: str | None = None
+        self._history: list[dict[str, Any]] = []
         self._best: float | None = None
-        # Baseline reference time (us), measured once at run start and pinned as the
-        # fixed denominator for pct_baseline/speedup so every candidate shares one
-        # baseline (see _evolve_seed / bench.measure_baseline). None = not pinned;
-        # scoring then falls back to per-candidate baseline measurement.
-        self._baseline_us: float | None = None
-        self._dispatched = 0   # candidates dispatched this run (for the methodology phase)
-        self._logfile: Path | None = None  # full persistent narrative (set in setup)
-        # Serializes git plumbing that touches shared repo state (worktree
-        # add/remove, update-ref, reset) across the evolve worker threads.
+        # Per-GPU pinned baseline (us). Keyed by GPU index. Each GPU gets its own
+        # baseline measurement so pct_baseline/speedup ratios are valid when
+        # candidates on different GPUs share one denominator.
+        self._baselines: dict[int, float | None] = dict.fromkeys(self._gpu_indices)
+        self._dispatched = 0
+        self._logfile: Path | None = None
         self._git_lock = threading.Lock()
 
     # --- helpers ---
@@ -188,7 +175,7 @@ class Orchestrator:
             except OSError:
                 pass
 
-    def _publish(self, **kw) -> None:
+    def _publish(self, **kw: object) -> None:
         if self.bus:
             self.bus.publish(**kw)
 
@@ -200,6 +187,14 @@ class Orchestrator:
 
     def _parallelism(self) -> int:
         return self.bus.parallelism() if self.bus else self.cfg.parallelism
+
+    def _default_gpu(self) -> int:
+        """First GPU in the pool (for seed, methodology, and other singleton ops)."""
+        return self._gpu_indices[0]
+
+    def _pick_gpu(self) -> int:
+        """Return the GPU index with fewest in-flight tasks (round-robin on ties)."""
+        return min(self._gpu_in_flight, key=lambda i: self._gpu_in_flight[i])
 
     def _budget_desc(self) -> str:
         """Human description of the real search budget -- the candidate/wall-clock
@@ -213,16 +208,23 @@ class Orchestrator:
             return "unbounded (runs until a manual stop)"
         return " or ".join(parts) + (" (whichever comes first)" if len(parts) > 1 else "")
 
-    def _guard(self, dirs: LoopDirs, rnd: int, phase: str,
-               project_root: Path | None = None, loop_dir: Path | None = None) -> dict:
+    def _guard(
+        self,
+        dirs: LoopDirs,
+        rnd: int,
+        phase: str,
+        project_root: Path | None = None,
+        loop_dir: Path | None = None,
+    ) -> dict[str, Any]:
         """Context handed to the opencode PreToolUse guard (oc_guard/guard.js).
 
         Lets the guard reject writes/edits/reads/bash that would corrupt loop
         infrastructure (state file, plan, plan backup, prompt/summary/contract
         files, git push). ``phase`` is one of impl/review/finalize/methodology.
         """
-        from .bootstrap import _protected_files
+        from .bootstrap import protected_files
         from .config import REPO_ROOT
+
         root = Path(project_root or self.wd).resolve()
         return {
             "loopDir": str((loop_dir or dirs.base).resolve()),
@@ -232,38 +234,40 @@ class Orchestrator:
             "phase": phase,
             "gpuRun": str(REPO_ROOT / "kernelthing" / "gpu_run.sh"),
             "editFiles": [str(Path(f)) for f in self.problem.edit_files],
-            "editDir": str(root / self.problem.rel_dir) if self.problem.rel_dir not in ("", ".") else str(root),
-            "protectedFiles": sorted(_protected_files(self.problem)),
+            "editDir": str(root / self.problem.rel_dir)
+            if self.problem.rel_dir not in ("", ".")
+            else str(root),
+            "protectedFiles": sorted(protected_files(self.problem)),
         }
 
     def _score_cmd_str(self) -> str:
         """Absolute-path scoring command the agent can self-test with.
-        
+
         When pygpubench is on the problem's score_command is empty (the orchestrator
         uses bench.score directly), but the agent still needs a working self-test
         command. Construct one from the venv so the agent never has to discover
         kernelthing on PATH.
         """
-        from .config import REPO_ROOT
+
         venv_bin = Path(sys.executable).parent
         kt = str(venv_bin / "kernelthing")
         if self.problem.score_command:
             return self.problem.score_command
         return f"{kt} score ."
 
-    def _prompt_common(self, state: State) -> dict:
+    def _prompt_common(self, state: State) -> dict[str, Any]:
         """Template fields shared by every operator prompt + the descriptor footer."""
         from .config import REPO_ROOT
-        return dict(
-            PLAN=state.plan_file,
-            PLAN_FILE=state.plan_file,
-            EDIT_FILES=", ".join(self.problem.edit_files),
-            SCORE_CMD=self._score_cmd_str(),
-            GPU_RUN=str(REPO_ROOT / "kernelthing" / "gpu_run.sh"),
-            UNIT=self.problem.unit or self.problem.metric_name,
-            BITLESSON_FILE=state.bitlesson_file,
-            KERNEL_TOOLS=self._kernel_tools_block(),
-        )
+
+        return {
+            "PLAN": state.plan_file,
+            "PLAN_FILE": state.plan_file,
+            "EDIT_FILES": ", ".join(self.problem.edit_files),
+            "SCORE_CMD": self._score_cmd_str(),
+            "GPU_RUN": str(REPO_ROOT / "kernelthing" / "gpu_run.sh"),
+            "UNIT": self.problem.unit or self.problem.metric_name,
+            "KERNEL_TOOLS": self._kernel_tools_block(),
+        }
 
     def _kernel_tools_block(self) -> str:
         """Assemble the optional kernel-domain tool guidance (KDA skills) appended
@@ -273,6 +277,7 @@ class Orchestrator:
         read-only-bound in the sandbox, so they resolve from any worktree.
         """
         from .config import REPO_ROOT
+
         parts: list[str] = []
         pyexe = sys.executable or "python3"
         gpu_run = str(REPO_ROOT / "kernelthing" / "gpu_run.sh")
@@ -291,25 +296,36 @@ class Orchestrator:
                 "own. Use the wait time to plan or read.\n\n"
                 "CPU-only commands (building with `nvcc`, querying KernelWiki, "
                 "parsing `.ncu-rep` files) do NOT need it. Profilers are enforced; "
-                "wrap your benchmark binaries too.")
+                "wrap your benchmark binaries too."
+            )
         if self.cfg.wiki:
-            parts.append(prompts.load_and_render_safe(
-                "claude/kernel-tools-wiki.md", "",
-                PYTHON=pyexe,
-                WIKI_DIR=str(REPO_ROOT / "vendor" / "KernelWiki")))
+            parts.append(
+                prompts.load_and_render_safe(
+                    "claude/kernel-tools-wiki.md",
+                    "",
+                    PYTHON=pyexe,
+                    WIKI_DIR=str(REPO_ROOT / "vendor" / "KernelWiki"),
+                )
+            )
         if self.cfg.ncu:
             ncu_pp = sorted((Path("/opt/nvidia/nsight-compute")).glob("*/extras/python"))
-            parts.append(prompts.load_and_render_safe(
-                "claude/kernel-tools-ncu.md", "",
-                PYTHON=pyexe,
-                GPU_RUN=gpu_run,
-                NCU_DIR=str(REPO_ROOT / "vendor" / "ncu-report-skill"),
-                NCU_BIN=shutil.which("ncu") or "/usr/local/cuda/bin/ncu",
-                NCU_PYTHONPATH=str(ncu_pp[-1]) if ncu_pp else ""))
+            parts.append(
+                prompts.load_and_render_safe(
+                    "claude/kernel-tools-ncu.md",
+                    "",
+                    PYTHON=pyexe,
+                    GPU_RUN=gpu_run,
+                    NCU_DIR=str(REPO_ROOT / "vendor" / "ncu-report-skill"),
+                    NCU_BIN=shutil.which("ncu") or "/usr/local/cuda/bin/ncu",
+                    NCU_PYTHONPATH=str(ncu_pp[-1]) if ncu_pp else "",
+                )
+            )
         parts = [p for p in parts if p.strip()]
         if not parts:
             return ""
-        return "\n\n---\n\n## Kernel optimization tools (available in your sandbox)\n" + "\n".join(parts)
+        return "\n\n---\n\n## Kernel optimization tools (available in your sandbox)\n" + "\n".join(
+            parts
+        )
 
     # --- setup ---
     def setup(self) -> tuple[State, LoopDirs]:
@@ -324,49 +340,74 @@ class Orchestrator:
         dirs = LoopDirs(self.wd, ts).ensure()
         self._logfile = dirs.base / "loop.log"
         state = State(
-            timestamp=ts, plan_file=self.problem.plan,
+            timestamp=ts,
+            plan_file=self.problem.plan,
             model=self.cfg.model,
-            start_branch=start_branch, base_branch=start_branch, base_commit=base_commit,
-            bitlesson_required=self.cfg.bitlesson_required,
-            bitlesson_file=".humanize/bitlesson.md", methodology=self.cfg.methodology,
+            start_branch=start_branch,
+            base_branch=start_branch,
+            base_commit=base_commit,
+            methodology=self.cfg.methodology,
         )
         shutil.copyfile(self.wd / self.problem.plan, dirs.plan_backup)
-        dirs.goal_tracker.write_text(GOAL_TRACKER_SEED, encoding="utf-8")
-        bl = self.wd / state.bitlesson_file
-        bl.parent.mkdir(parents=True, exist_ok=True)
-        if not bl.exists():
-            bl.write_text(BITLESSON_SEED, encoding="utf-8")
         save_state(dirs, state)
         self._log("=" * 72)
         self._log(f"SETUP  problem '{self.problem.name}'")
         self._log(f"  repo        {self.wd}")
-        self._log(f"  metric      {self.problem.metric_name or self.problem.unit} "
-                  f"({self.problem.unit}, {self.problem.direction})")
+        self._log(
+            f"  metric      {self.problem.metric_name or self.problem.unit} "
+            f"({self.problem.unit}, {self.problem.direction})"
+        )
         self._log(f"  start       branch {start_branch} @ {base_commit[:8]}")
-        self._log(f"  config      budget {self.cfg.max_candidates or '∞'} candidates"
-                  + (f"/{format_duration(self.cfg.wall_clock_s)}" if self.cfg.wall_clock_s else "")
-                  + f" | parallelism {self._parallelism()} | elite_k {self.cfg.elite_k} | "
-                  f"model {self.cfg.model}")
+        self._log(
+            f"  config      budget {self.cfg.max_candidates or '∞'} candidates"
+            + (f"/{format_duration(self.cfg.wall_clock_s)}" if self.cfg.wall_clock_s else "")
+            + f" | parallelism {self._parallelism()} | elite_k {self.cfg.elite_k} | "
+            f"model {self.cfg.model}"
+        )
         self._log(f"  artifacts   {dirs.base}  (full log: loop.log)")
         self._log("=" * 72)
-        self._publish(problem=self.problem.name, unit=self.problem.unit,
-                      direction=self.problem.direction,
-                      loop_dir=str(dirs.base), logfile="loop.log",
-                      history=self._history, best=self._best, agents=[])
+        self._publish(
+            problem=self.problem.name,
+            unit=self.problem.unit,
+            direction=self.problem.direction,
+            loop_dir=str(dirs.base),
+            logfile="loop.log",
+            history=self._history,
+            best=self._best,
+            agents=[],
+        )
         return state, dirs
 
-    def _run_implementer(self, prompt: str, log_path: Path,
-                         guard: dict | None = None) -> opencode_client.OpencodeResult:
+    def _run_implementer(
+        self,
+        prompt: str,
+        log_path: Path,
+        *,
+        gpu_index: int | None = None,
+        guard: dict[str, Any] | None = None,
+    ) -> opencode_client.OpencodeResult:
+        gpu = gpu_index if gpu_index is not None else self._default_gpu()
         res = opencode_client.run(
-            prompt, working_dir=self.wd, model=self.cfg.model, session=self.impl_session,
-            timeout=self.cfg.opencode_timeout, gpu_index=self.cfg.gpu_index,
-            writable=True, sandboxed=self.cfg.sandbox, log_path=log_path, guard=guard,
-            ncu=self.cfg.ncu, gpu_lock=gpulock.lock_path(self.cfg.gpu_index))
+            prompt,
+            working_dir=self.wd,
+            model=self.cfg.model,
+            session=self.impl_session,
+            timeout=self.cfg.opencode_timeout,
+            gpu_index=gpu,
+            writable=True,
+            sandboxed=self.cfg.sandbox,
+            log_path=log_path,
+            guard=guard,
+            ncu=self.cfg.ncu,
+            gpu_lock=gpulock.lock_path(gpu),
+        )
         if res.session_id:
             self.impl_session = res.session_id
         return res
 
-    def _score_worktree(self, wt: Path) -> tuple[bool, float | None, str | None]:
+    def _score_worktree(
+        self, wt: Path, *, gpu_index: int = 0
+    ) -> tuple[bool, float | None, str | None]:
         """Score the worktree, returning (correct, metric, err).
 
         Default (cfg.pygpubench): delegate to the in-process adversarial benchmark
@@ -376,15 +417,23 @@ class Orchestrator:
         implementations); best_metric is the best observed across runs per the
         problem's direction (robust to jitter).
         """
+        baseline = self._baselines.get(gpu_index)
         if self.cfg.pygpubench:
-            return bench.score(self.problem, wt, baseline_median=self._baseline_us)
+            return bench.score(self.problem, wt, baseline_median=baseline, gpu_index=gpu_index)
         cwd = wt / self.problem.rel_dir
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(self.cfg.gpu_index))
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu_index))
         all_correct, metrics, err = True, [], None
         for _ in range(self.problem.bench_runs):
             try:
-                r = subprocess.run(self.problem.score_command, shell=True, cwd=str(cwd),
-                                   capture_output=True, text=True, env=env, timeout=900)
+                r = subprocess.run(
+                    self.problem.score_command,
+                    shell=True,
+                    cwd=str(cwd),
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=900,
+                )
             except subprocess.TimeoutExpired:
                 return False, None, "score timeout"
             correct, metric = bench.parse_score(r.stdout)
@@ -399,7 +448,9 @@ class Orchestrator:
         best = max(metrics) if self.problem.direction == "maximize" else min(metrics)
         return all_correct, best, None
 
-    def _guarded_score(self, wt: Path) -> tuple[bool, float | None, str | None]:
+    def _guarded_score(
+        self, wt: Path, *, gpu_index: int = 0
+    ) -> tuple[bool, float | None, str | None]:
         """Run the cheap static cheat gate (kernelguard) BEFORE the expensive bench:
         a detected cheat is disqualified outright and never scored. The kernel is
         pre-compiled outside the GPU lock so the benchmark only pays runtime."""
@@ -407,12 +458,15 @@ class Orchestrator:
             bench.warm_build(self.problem, wt)
         if self.cfg.kernelguard:
             cheats = gates.kernelguard_violations(
-                self.problem.edit_files, wt, profile=self.cfg.kernelguard_profile,
-                metadata={"problem_name": self.problem.name})
+                self.problem.edit_files,
+                wt,
+                profile=self.cfg.kernelguard_profile,
+                metadata={"problem_name": self.problem.name},
+            )
             if cheats:
                 return False, None, "kernelguard: " + ", ".join(x["file"] for x in cheats)
-        with gpulock.gpu_lock(self.cfg.gpu_index):
-            return self._score_worktree(wt)
+        with gpulock.gpu_lock(gpu_index):
+            return self._score_worktree(wt, gpu_index=gpu_index)
 
     # --- async evolutionary search ---
     @staticmethod
@@ -422,25 +476,33 @@ class Orchestrator:
     def _evolve_ref(self, ts: str, member_id: int) -> str:
         return f"refs/kernelthing/{ts}/mem-{member_id}"
 
-    def _evolve_prompt(self, operator: str, parent: evolve.Member | None,
-                       state: State, known_strategies: str) -> str:
+    def _evolve_prompt(
+        self, operator: str, parent: evolve.Member | None, state: State, known_strategies: str
+    ) -> str:
         common = self._prompt_common(state)
         if operator == evolve.OP_EXPLORE:
-            body = prompts.render(EVOLVE_EXPLORE_PROMPT,
-                                  PARENT_METRIC=self._fmt(parent.metric) if parent else "?",
-                                  PARENT_COMMIT_MESSAGE=(parent.commit_message if parent
-                                                         else "baseline"),
-                                  KNOWN_STRATEGIES=known_strategies or "(none yet)", **common)
+            body = prompts.render(
+                EVOLVE_EXPLORE_PROMPT,
+                PARENT_METRIC=self._fmt(parent.metric) if parent else "?",
+                PARENT_COMMIT_MESSAGE=(parent.commit_message if parent else "baseline"),
+                KNOWN_STRATEGIES=known_strategies or "(none yet)",
+                **common,
+            )
         else:  # exploit
             assert parent is not None
-            body = prompts.render(EVOLVE_EXPLOIT_PROMPT,
-                                  PARENT_METRIC=self._fmt(parent.metric),
-                                  PARENT_COMMIT_MESSAGE=parent.commit_message or "(no commit message)",
-                                  **common)
-        return body + prompts.render(EVOLVE_DESCRIPTOR_FOOTER, **common) + common["KERNEL_TOOLS"]
+            body = prompts.render(
+                EVOLVE_EXPLOIT_PROMPT,
+                PARENT_METRIC=self._fmt(parent.metric),
+                PARENT_COMMIT_MESSAGE=parent.commit_message or "(no commit message)",
+                **common,
+            )
+        return (
+            body + prompts.render(EVOLVE_DESCRIPTOR_FOOTER, **common) + str(common["KERNEL_TOOLS"])
+        )
 
-    def _evolve_task(self, task: evolve.Task, base: str, wt_root: Path,
-                     dirs: LoopDirs) -> evolve.Member:
+    def _evolve_task(
+        self, task: evolve.Task, base: str, wt_root: Path, dirs: LoopDirs, gpu_index: int
+    ) -> evolve.Member:
         """Worker: fork a worktree, run one agent turn, then (serialized) score it.
 
         Pure git plumbing is taken under ``self._git_lock``; the agent turn and the
@@ -454,36 +516,51 @@ class Orchestrator:
         wt = wt_root / f"m{task.member_id}"
         try:
             with self._git_lock:
-                rc = gates.git(["worktree", "add", "--detach", "--force",
-                                str(wt), parent_commit], self.wd).returncode
+                rc = gates.git(
+                    ["worktree", "add", "--detach", "--force", str(wt), parent_commit], self.wd
+                ).returncode
             if rc != 0:
                 m.error = "worktree add failed"
                 return m
             log = dirs.base / f"mem-{task.member_id}-{task.operator}-opencode.log"
-            guard = self._guard(dirs, task.member_id, "impl", project_root=wt,
-                                loop_dir=wt / ".humanize" / "rlcr" / "candidate")
+            guard = self._guard(
+                dirs,
+                task.member_id,
+                "impl",
+                project_root=wt,
+                loop_dir=wt / ".humanize" / "rlcr" / "candidate",
+            )
             opencode_client.run(
-                task.prompt, working_dir=wt, model=self.cfg.model, session=None,
-                timeout=self.cfg.opencode_timeout, gpu_index=self.cfg.gpu_index,
-                writable=True, sandboxed=self.cfg.sandbox, log_path=log,
-                data_dir=wt / ".humanize" / "oc-data", extra_writable=[self.wd / ".git"],
-                guard=guard, ncu=self.cfg.ncu,
-                gpu_lock=gpulock.lock_path(self.cfg.gpu_index))
+                task.prompt,
+                working_dir=wt,
+                model=self.cfg.model,
+                session=None,
+                timeout=self.cfg.opencode_timeout,
+                gpu_index=gpu_index,
+                writable=True,
+                sandboxed=self.cfg.sandbox,
+                log_path=log,
+                data_dir=wt / ".humanize" / "oc-data",
+                extra_writable=[self.wd / ".git"],
+                guard=guard,
+                ncu=self.cfg.ncu,
+                gpu_lock=gpulock.lock_path(gpu_index),
+            )
             head = gates.git(["rev-parse", "HEAD"], wt).stdout.strip()
             m.commit = head if head and head != parent_commit else None
             if m.commit:
                 m.commit_message = gates.git(
-                    ["log", "-1", "--format=%s", "HEAD"], wt).stdout.strip()
+                    ["log", "-1", "--format=%s", "HEAD"], wt
+                ).stdout.strip()
             sm = wt / "candidate-summary.md"
             m.summary_text = sm.read_text(encoding="utf-8") if sm.exists() else ""
             if m.commit is None:
                 m.error = m.error or "no commit"
                 return m
-            # score the COMMITTED state: restore edit files from HEAD, gate, bench
             with self._git_lock:
                 gates.git(["checkout", "--", *self.problem.edit_files], wt)
-            m.correct, m.metric, m.error = self._guarded_score(wt)
-        except Exception as e:  # noqa: BLE001  -- a crashed worker must not kill the loop
+            m.correct, m.metric, m.error = self._guarded_score(wt, gpu_index=gpu_index)
+        except Exception as e:
             m.error = repr(e)
         finally:
             with self._git_lock:
@@ -495,61 +572,244 @@ class Orchestrator:
 
         If it scores, it is the first elite; if not, the population starts empty and
         every operator falls back to explore (forking the base) until one works.
+
+        Baselines are measured on every GPU in the pool so each device gets its own
+        pinned denominator for pct_baseline/speedup metrics.
         """
-        m = evolve.Member(id=pop.next_id(), operator="seed", commit=base,
-                          commit_message="baseline")
+        m = evolve.Member(id=pop.next_id(), operator="seed", commit=base, commit_message="baseline")
+        seed_gpu = self._default_gpu()
         wt = wt_root / "seed"
         with self._git_lock:
             gates.git(["worktree", "add", "--detach", "--force", str(wt), base], self.wd)
         try:
-            with gpulock.gpu_lock(self.cfg.gpu_index):
-                # Pin the baseline ONCE here so every candidate (and the seed
-                # itself) is scored against one fixed denominator -- the baseline
-                # is then exactly 100%. Falls back to per-candidate measurement if
-                # it fails or the problem has no baseline (measure_baseline -> None).
+            with gpulock.gpu_lock(seed_gpu):
                 if self.cfg.pygpubench:
-                    self._baseline_us, berr = bench.measure_baseline(self.problem, wt)
+                    bl, berr = bench.measure_baseline(self.problem, wt, gpu_index=seed_gpu)
                     if berr:
-                        self._log(f"baseline pin failed ({berr}); "
-                                  "falling back to per-candidate baseline")
-                    elif self._baseline_us is not None:
-                        self._log(f"baseline pinned: {self._baseline_us:.1f}us "
-                                  "(= 100%, fixed for the run)")
-                m.correct, m.metric, m.error = self._score_worktree(wt)
+                        self._log(
+                            f"baseline pin failed on GPU {seed_gpu} ({berr}); "
+                            "falling back to per-candidate baseline"
+                        )
+                    elif bl is not None:
+                        self._baselines[seed_gpu] = bl
+                        self._log(
+                            f"GPU {seed_gpu} baseline pinned: {bl:.1f}us "
+                            "(= 100%, fixed for the run)"
+                        )
+                m.correct, m.metric, m.error = self._score_worktree(wt, gpu_index=seed_gpu)
+            # Measure baselines on the remaining GPUs in the pool.
+            for gpu in self._gpu_indices:
+                if gpu == seed_gpu:
+                    continue
+                with gpulock.gpu_lock(gpu):
+                    if self.cfg.pygpubench:
+                        bl, berr = bench.measure_baseline(self.problem, wt, gpu_index=gpu)
+                        if berr:
+                            self._log(f"GPU {gpu} baseline pin failed ({berr})")
+                        elif bl is not None:
+                            self._baselines[gpu] = bl
+                            self._log(f"GPU {gpu} baseline pinned: {bl:.1f}us")
         finally:
             with self._git_lock:
                 gates.git(["worktree", "remove", "--force", str(wt)], self.wd)
         pop.insert(m)
         return m
 
-    def _evolve_members(self, pop: evolve.Population) -> list[dict]:
+    def _evolve_members(self, pop: evolve.Population) -> list[dict[str, Any]]:
         """Full population snapshot for the UI -- drives the fitness chart, the
         niches, the lineage tree, and the leaderboard. Compact rows;
         the in-flight agents are published separately (they are not yet members)."""
         best = pop.best()
         best_id = best.id if best else None
-        return [{
-            "id": m.id, "op": m.operator, "parent": m.parent_id,
-            "metric": m.metric, "correct": m.correct,
-            "status": m.status, "commit": (m.commit or "")[:8],
-            "message": m.commit_message, "error": m.error,
-            "best": m.id == best_id,
-        } for m in pop.members]
+        return [
+            {
+                "id": m.id,
+                "op": m.operator,
+                "parent": m.parent_id,
+                "metric": m.metric,
+                "correct": m.correct,
+                "status": m.status,
+                "commit": (m.commit or "")[:8],
+                "message": m.commit_message,
+                "error": m.error,
+                "best": m.id == best_id,
+            }
+            for m in pop.members
+        ]
+
+    # --- evolutionary-search control (extracted from run() closures) ---
+
+    def _ev_wall_limit(self) -> int:
+        """Live wall-clock budget in seconds (0 = off)."""
+        return self.bus.wall_clock() if self.bus else self.cfg.wall_clock_s
+
+    def _ev_target(self) -> int:
+        """Live parallelism cap bounded by the static pool size."""
+        pool_cap = max(1, self.cfg.parallelism)
+        return max(1, min(self._parallelism(), pool_cap))
+
+    def _ev_clock(self, rc: RunContext, running: bool) -> dict[str, Any]:
+        """Time payload for the UI: epoch start, elapsed, limit."""
+        limit = self._ev_wall_limit()
+        elapsed = int(time.time() - rc.search_start) if rc.search_start is not None else 0
+        return {
+            "start": rc.search_start,
+            "elapsed": elapsed,
+            "limit": limit,
+            "running": running,
+        }
+
+    def _ev_want_more(self, rc: RunContext) -> bool:
+        """True while neither the candidate budget, wall-clock, nor stop flag is hit."""
+        if self.bus and self.bus.stop_requested():
+            return False
+        maxc = self.bus.max_candidates() if self.bus else self.cfg.max_candidates
+        if maxc and rc.dispatched >= maxc:
+            return False
+        limit = self._ev_wall_limit()
+        assert rc.search_start is not None  # set before dispatch loop begins
+        return not (limit and time.time() - rc.search_start >= limit)
+
+    def _ev_publish(self, rc: RunContext, pop: evolve.Population) -> None:
+        """Push the full live search state to the UI."""
+        self._publish(
+            mode="evolve",
+            best=self._best,
+            submitted=rc.dispatched,
+            members=self._evolve_members(pop),
+            clock=self._ev_clock(rc, True),
+            explore_bias=(self.bus.explore_bias() if self.bus else 50),
+            explore_auto=(self.bus.explore_auto() if self.bus else False),
+            agents=[
+                {
+                    "id": t.member_id,
+                    "op": t.operator,
+                    "parent": t.parent_id,
+                    "log_file": f"mem-{t.member_id}-{t.operator}-opencode.log",
+                }
+                for t, _g in rc.futures.values()
+            ],
+        )
+
+    def _ev_dispatch(
+        self,
+        rc: RunContext,
+        pop: evolve.Population,
+        state: State,
+        base: str,
+        wt_root: Path,
+        dirs: LoopDirs,
+        rng: random.Random,
+        ex: ThreadPoolExecutor,
+    ) -> None:
+        """Pick an operator + parent, fork a worker, and register the future."""
+        cfg = self.cfg
+        have_elites = bool(pop.elites())
+        if self.bus and not self.bus.explore_auto():
+            explore_frac = self.bus.explore_bias() / 100.0
+        elif cfg.max_candidates:
+            progress = min(1.0, rc.dispatched / max(cfg.max_candidates, 1))
+            explore_frac = 0.8 - 0.6 * progress
+        else:
+            explore_frac = 0.5
+        op = evolve.choose_operator(
+            rng,
+            {evolve.OP_EXPLORE: explore_frac, evolve.OP_EXPLOIT: 1.0 - explore_frac},
+            have_elites=have_elites,
+            n_niches=len(pop.niches()),
+            min_niches=cfg.min_niches,
+        )
+        parent = pop.select_parent(op, rng, rc.in_flight)
+        if parent is None:
+            op = evolve.OP_EXPLORE
+        mid = pop.next_id()
+        prompt = self._evolve_prompt(op, parent, state, ", ".join(sorted(pop.niches().keys())))
+        task = evolve.Task(
+            member_id=mid,
+            operator=op,
+            parent_id=(parent.id if parent else None),
+            parent_commit=(parent.commit if parent else None),
+            prompt=prompt,
+        )
+        gpu = self._pick_gpu()
+        self._gpu_in_flight[gpu] += 1
+        fut = ex.submit(self._evolve_task, task, base, wt_root, dirs, gpu)
+        rc.futures[fut] = (task, gpu)
+        if parent is not None:
+            rc.in_flight[parent.id] = rc.in_flight.get(parent.id, 0) + 1
+            parent.children += 1
+        rc.dispatched += 1
+        ptxt = f" <- mem {parent.id}" if parent else ""
+        self._log(f"dispatch mem {mid}: {op}{ptxt} -> GPU {gpu}  (in-flight {len(rc.futures)})")
+        self._ev_publish(rc, pop)
+
+    def _ev_collect(
+        self,
+        rc: RunContext,
+        pop: evolve.Population,
+        state: State,
+        dirs: LoopDirs,
+        unit: str,
+        fut: Any,
+        base: str,
+        wt_root: Path,
+        rng: random.Random,
+        ex: ThreadPoolExecutor,
+    ) -> None:
+        """Absorb one completed future into the population, then refill workers."""
+        task, gpu = rc.futures.pop(fut)
+        self._gpu_in_flight[gpu] = max(0, self._gpu_in_flight.get(gpu, 1) - 1)
+        if task.parent_id is not None:
+            rc.in_flight[task.parent_id] = max(0, rc.in_flight.get(task.parent_id, 1) - 1)
+        try:
+            m = fut.result()
+        except Exception as e:
+            m = evolve.Member(
+                id=task.member_id,
+                operator=task.operator,
+                parent_id=task.parent_id,
+                error=repr(e),
+            )
+        pop.insert(m)
+        if m.viable:
+            assert m.commit is not None
+            with self._git_lock:
+                gates.git(
+                    ["update-ref", self._evolve_ref(state.timestamp, m.id), m.commit],
+                    self.wd,
+                )
+            dirs.summary(m.id).write_text(m.summary_text or "(no summary)", encoding="utf-8")
+        best = pop.best()
+        self._best = best.metric if best else self._best
+        ptxt = f"<-{task.parent_id} " if task.parent_id is not None else ""
+        res = (
+            f"{m.metric:.1f}{unit} ✓ [{m.commit_message[:50]}]"
+            if m.viable
+            else f"✗ {m.error or 'no result'}"
+        )
+        self._log(
+            f"result mem {m.id} ({m.operator} {ptxt}): {res}  · best {self._fmt(self._best)}{unit}"
+        )
+        if m.viable:
+            self._history.append({"round": m.id, "metric": m.metric})
+        self._ev_publish(rc, pop)
+        if self._ev_want_more(rc):
+            while len(rc.futures) < self._ev_target() and self._ev_want_more(rc):
+                self._ev_dispatch(rc, pop, state, base, wt_root, dirs, rng, ex)
+
+    # --- run: the evolutionary search loop ---
 
     def run(self) -> str:
         """Steady-state asynchronous evolutionary search (see kernelthing/evolve.py).
 
         Keeps up to ``-j``/parallelism agents editing at once (live-tunable down via
-        the web UI); all GPU work (each agent's build/run/profile via ``gpu-run``
-        and the authoritative benchmark) is serialized by the per-device flock
-        (kernelthing/gpulock.py), so the device is never shared. Dispatches
-        explore/exploit tasks against a durable population until the
-        candidate / wall-clock budget is spent or a stop is requested, then
-        promotes the single best-scoring kernel to HEAD.
+        the web UI); all GPU work is serialized by the per-device flock. Dispatches
+        explore/exploit tasks against a durable population until the budget is
+        spent or a stop is requested, then promotes the best kernel to HEAD.
         """
         state, dirs = self.setup()
         cfg = self.cfg
-        u = self.problem.unit
+        unit = self.problem.unit
         rng = random.Random(cfg.evolve_seed)
         pop = evolve.Population(direction=self.problem.direction, elite_k=cfg.elite_k)
         base = self._git(["rev-parse", "HEAD"])
@@ -557,155 +817,61 @@ class Orchestrator:
         wt_root = cfg.problem_root / "wt" / state.timestamp / "evolve"
         shutil.rmtree(wt_root, ignore_errors=True)
         wt_root.mkdir(parents=True, exist_ok=True)
-        search_start: float | None = None   # set after the seed benchmark (see below)
 
-        def wall_limit() -> int:
-            """Live wall-clock budget in seconds (0 = off). The web UI can retune it
-            mid-run via the bus; headless falls back to the static config value."""
-            return self.bus.wall_clock() if self.bus else cfg.wall_clock_s
-
-        def clock(running: bool) -> dict:
-            """Time payload for the UI: epoch start (so the client can tick between
-            polls), elapsed-so-far, and the current (live) limit."""
-            limit = wall_limit()
-            elapsed = int(time.time() - search_start) if search_start is not None else 0
-            return {"start": search_start, "elapsed": elapsed,
-                    "limit": limit, "running": running}
-
-        # Launch -j is the hard pool size; the live bus value (web UI slider) can
-        # only throttle dispatch down within that cap, never above it.
         pool_cap = max(1, cfg.parallelism)
-        target = lambda: max(1, min(self._parallelism(), pool_cap))   # noqa: E731
-
         self._log("")
-        self._log(f"──── EVOLVE  parallelism {pool_cap} · budget "
-                  f"{cfg.max_candidates or '∞'} candidates"
-                  + (f" / {format_duration(cfg.wall_clock_s)}" if cfg.wall_clock_s else "") + " ────")
-        in_flight: dict[int, int] = {}        # parent_id -> dispatched-not-yet-scored
-        futures: dict = {}                    # future -> Task
-        dispatched = 0
+        self._log(
+            f"──── EVOLVE  parallelism {pool_cap} · budget "
+            f"{cfg.max_candidates or '∞'} candidates"
+            + (f" / {format_duration(cfg.wall_clock_s)}" if cfg.wall_clock_s else "")
+            + " ────"
+        )
 
-        def publish_state() -> None:
-            """Push the full live search state to the UI: the completed population
-            (chart / niches / lineage / leaderboard) and the in-flight agents, each
-            tagged with its opencode log basename so the web server can tail it for
-            live tool calls (the controller can't see inside a running turn)."""
-            self._publish(
-                mode="evolve", best=self._best, submitted=dispatched,
-                members=self._evolve_members(pop), clock=clock(True),
-                explore_bias=(self.bus.explore_bias() if self.bus else 50),
-                explore_auto=(self.bus.explore_auto() if self.bus else False),
-                agents=[{"id": t.member_id, "op": t.operator, "parent": t.parent_id,
-                         "log_file": f"mem-{t.member_id}-{t.operator}-opencode.log"}
-                        for t in futures.values()])
-
-        self._publish(phase="evolve", mode="evolve", scoreboard=[], members=[], agents=[],
-                      submitted=0, parallelism=pool_cap, clock=clock(False),
-                      budget={"candidates": cfg.max_candidates or None,
-                              "wall_clock_s": cfg.wall_clock_s or None})
+        rc = RunContext()
+        self._publish(
+            phase="evolve",
+            mode="evolve",
+            scoreboard=[],
+            members=[],
+            agents=[],
+            submitted=0,
+            parallelism=pool_cap,
+            clock=self._ev_clock(rc, False),
+            budget={
+                "candidates": cfg.max_candidates or None,
+                "wall_clock_s": cfg.wall_clock_s or None,
+            },
+        )
 
         seed = self._evolve_seed(base, wt_root, pop)
         self._best = seed.metric if seed.viable else None
-        self._log(f"seed (HEAD {base[:8]}): "
-                  + (f"{seed.metric:.1f}{u} ✓" if seed.viable else f"✗ {seed.error or 'no score'}"))
-        publish_state()
+        self._log(
+            f"seed (HEAD {base[:8]}): "
+            + (f"{seed.metric:.1f}{unit} ✓" if seed.viable else f"✗ {seed.error or 'no score'}")
+        )
+        self._ev_publish(rc, pop)
 
-        # Start the wall-clock budget *after* the fixed-cost seed benchmark: a CUDA
-        # compile + pygpubench repeats can themselves exceed a short -w, which would
-        # otherwise burn the whole budget before a single candidate is dispatched.
-        search_start = time.time()
-
-        def want_more() -> bool:
-            if self.bus and self.bus.stop_requested():
-                return False
-            maxc = self.bus.max_candidates() if self.bus else cfg.max_candidates
-            if maxc and dispatched >= maxc:
-                return False
-            limit = wall_limit()   # live: the UI can raise/lower it mid-run
-            if limit and time.time() - search_start >= limit:
-                return False
-            return True
-
-        def submit_one(ex: ThreadPoolExecutor) -> None:
-            nonlocal dispatched
-            have_elites = bool(pop.elites())
-            # Effective explore fraction: auto-schedule ramps from 80→20 over the run,
-            # or manual slider value if the user moved it.
-            if self.bus and not self.bus.explore_auto():
-                explore_frac = self.bus.explore_bias() / 100.0
-            elif cfg.max_candidates:
-                progress = min(1.0, dispatched / max(cfg.max_candidates, 1))
-                explore_frac = 0.8 - 0.6 * progress   # 0.8 → 0.8 → 0.2
-            else:
-                explore_frac = 0.5   # unbounded + no bus = equal
-            op = evolve.choose_operator(
-                rng, {evolve.OP_EXPLORE: explore_frac, evolve.OP_EXPLOIT: 1.0 - explore_frac},
-                have_elites=have_elites,
-                n_niches=len(pop.niches()), min_niches=cfg.min_niches)
-            parent = pop.select_parent(op, rng, in_flight)
-            if parent is None:
-                op = evolve.OP_EXPLORE   # no viable members to exploit or explore from
-            mid = pop.next_id()
-            prompt = self._evolve_prompt(op, parent, state,
-                                         ", ".join(sorted(pop.niches().keys())))
-            task = evolve.Task(member_id=mid, operator=op,
-                               parent_id=(parent.id if parent else None),
-                               parent_commit=(parent.commit if parent else None), prompt=prompt)
-            fut = ex.submit(self._evolve_task, task, base, wt_root, dirs)
-            futures[fut] = task
-            if parent is not None:
-                in_flight[parent.id] = in_flight.get(parent.id, 0) + 1
-                parent.children += 1
-            dispatched += 1
-            ptxt = f" <- mem {parent.id}" if parent else ""
-            self._log(f"dispatch mem {mid}: {op}{ptxt}  (in-flight {len(futures)})")
-            publish_state()
+        rc.search_start = time.time()
 
         with ThreadPoolExecutor(max_workers=pool_cap) as ex:
-            while want_more() and len(futures) < target():
-                submit_one(ex)
-            while futures:
-                done, _ = wait(list(futures), return_when=FIRST_COMPLETED)
+            while self._ev_want_more(rc) and len(rc.futures) < self._ev_target():
+                self._ev_dispatch(rc, pop, state, base, wt_root, dirs, rng, ex)
+            while rc.futures:
+                done, _ = wait(list(rc.futures), return_when=FIRST_COMPLETED)
                 for fut in done:
-                    task = futures.pop(fut)
-                    if task.parent_id is not None:
-                        in_flight[task.parent_id] = max(0, in_flight.get(task.parent_id, 1) - 1)
-                    try:
-                        m = fut.result()
-                    except Exception as e:  # noqa: BLE001
-                        m = evolve.Member(id=task.member_id, operator=task.operator,
-                                          parent_id=task.parent_id, error=repr(e))
-                    pop.insert(m)
-                    if m.viable:
-                        assert m.commit is not None
-                        with self._git_lock:
-                            gates.git(["update-ref", self._evolve_ref(state.timestamp, m.id),
-                                       m.commit], self.wd)
-                        dirs.summary(m.id).write_text(m.summary_text or "(no summary)",
-                                                      encoding="utf-8")
-                    best = pop.best()
-                    self._best = best.metric if best else self._best
-                    ptxt = f"<-{task.parent_id} " if task.parent_id is not None else ""
-                    res = (f"{m.metric:.1f}{u} ✓ [{m.commit_message[:50]}]" if m.viable
-                           else f"✗ {m.error or 'no result'}")
-                    self._log(f"result mem {m.id} ({m.operator} {ptxt}): {res}"
-                              f"  · best {self._fmt(self._best)}{u}")
-                    if m.viable:
-                        self._history.append({"round": m.id, "metric": m.metric})
-                    publish_state()
-                    if want_more():
-                        while len(futures) < target() and want_more():
-                            submit_one(ex)
+                    self._ev_collect(rc, pop, state, dirs, unit, fut, base, wt_root, rng, ex)
 
-        self._dispatched = dispatched
-        self._publish(clock=clock(False))   # freeze the UI timer at the final elapsed
+        self._dispatched = rc.dispatched
+        self._publish(clock=self._ev_clock(rc, False))
         best = pop.best()
         if best and best.commit:
             with self._git_lock:
                 gates.git(["reset", "--hard", best.commit], self.wd)
-            self._log(f"evolve: promoted mem {best.id} @ {best.metric:.1f}{u}"
-                      + (f" [{best.commit_message[:50]}]" if best.commit_message else "")
-                      + " to HEAD")
+            self._log(
+                f"evolve: promoted mem {best.id} @ {best.metric:.1f}{unit}"
+                + (f" [{best.commit_message[:50]}]" if best.commit_message else "")
+                + " to HEAD"
+            )
             self._persist_best(best)
         else:
             self._log("evolve: no viable kernel found; HEAD unchanged")
@@ -714,32 +880,22 @@ class Orchestrator:
         if self.bus and self.bus.stop_requested():
             return self._finish(state, dirs, EXIT_STOPPED, "stopped by user via the web UI")
         if best is None:
-            return self._finish(state, dirs, EXIT_STALL,
-                                f"evolutionary search ({dispatched} candidates) found nothing viable")
-        return self._finish(state, dirs, EXIT_MAXITER,
-                            f"evolutionary search budget spent: {dispatched} candidates, "
-                            f"best {best.metric:.1f}{u} [{best.operator}]")
+            return self._finish(
+                state,
+                dirs,
+                EXIT_STALL,
+                f"evolutionary search ({rc.dispatched} candidates) found nothing viable",
+            )
+        return self._finish(
+            state,
+            dirs,
+            EXIT_MAXITER,
+            f"evolutionary search budget spent: {rc.dispatched} candidates, "
+            f"best {best.metric:.1f}{unit} [{best.operator}]",
+        )
 
-    def _persist_best(self, best: evolve.Member) -> None:
-        """Copy the best kernel to a stable path that survives managed-repo wipes."""
-        out = self.cfg.problem_root / f"{self.problem.name}-best"
-        out.mkdir(parents=True, exist_ok=True)
-        for f in self.problem.edit_files:
-            src = self.wd / self.problem.rel_dir / f
-            shutil.copy(src, out / Path(f).name)
-        self._log(f"persisted best kernel to {out}")
-
-    def persist_current_head(self) -> None:
-        """Copy whatever kernel is at HEAD to the stable best-kernel path.
-        
-        Called on KeyboardInterrupt so a killed run still saves the last promoted
-        kernel, not just a clean exit."""
-        try:
-            head = self._git(["rev-parse", "HEAD"])
-        except Exception:
-            return
-        if head == getattr(self, '_base_commit', ''):
-            return
+    def _copy_best_kernel(self) -> Path:
+        """Copy the current HEAD kernel files to the stable best-kernel path."""
         out = self.cfg.problem_root / f"{self.problem.name}-best"
         out.mkdir(parents=True, exist_ok=True)
         for f in self.problem.edit_files:
@@ -747,12 +903,32 @@ class Orchestrator:
             if src.is_file():
                 shutil.copy(src, out / Path(f).name)
         self._log(f"persisted best kernel to {out}")
+        return out
+
+    def _persist_best(self, best: evolve.Member) -> None:
+        """Copy the best kernel to a stable path that survives managed-repo wipes."""
+        self._copy_best_kernel()
+
+    def persist_current_head(self) -> None:
+        """Copy whatever kernel is at HEAD to the stable best-kernel path.
+
+        Called on KeyboardInterrupt so a killed run still saves the last promoted
+        kernel, not just a clean exit."""
+        try:
+            head = self._git(["rev-parse", "HEAD"])
+        except Exception:
+            return
+        if head == getattr(self, "_base_commit", ""):
+            return
+        self._copy_best_kernel()
 
     def _evolve_cleanup(self, state: State, pop: evolve.Population, wt_root: Path) -> None:
         with self._git_lock:
             for m in pop.members:
                 if m.viable:
-                    gates.git(["update-ref", "-d", self._evolve_ref(state.timestamp, m.id)], self.wd)
+                    gates.git(
+                        ["update-ref", "-d", self._evolve_ref(state.timestamp, m.id)], self.wd
+                    )
             gates.git(["worktree", "prune"], self.wd)
         shutil.rmtree(wt_root, ignore_errors=True)
 
@@ -782,19 +958,32 @@ class Orchestrator:
         self._log(f"──── METHODOLOGY ANALYSIS (exit: {exit_reason}) ────")
         self._publish(phase="methodology analysis")
         prompt = prompts.render(
-            METHODOLOGY_PROMPT, LOOP_DIR=self._rel(dirs.base), EXIT_REASON=exit_reason,
-            EXIT_REASON_DESCRIPTION=desc, DISPATCHED=self._dispatched,
+            METHODOLOGY_PROMPT,
+            LOOP_DIR=self._rel(dirs.base),
+            EXIT_REASON=exit_reason,
+            EXIT_REASON_DESCRIPTION=desc,
+            DISPATCHED=self._dispatched,
             BUDGET=self._budget_desc(),
-            BEST=(self._best if self._best is not None else "n/a"), UNIT=self.problem.unit)
+            BEST=(self._best if self._best is not None else "n/a"),
+            UNIT=self.problem.unit,
+        )
         log_path = dirs.base / "methodology-opencode.log"
         guard = self._guard(dirs, state.current_round, "methodology")
         for _ in range(3):
             res = self._run_implementer(prompt, log_path, guard=guard)
-            self._log(f"methodology: analysis turn done (tools={res.tool_calls}, cost=${res.cost:.4f})")
-            if (report.is_file() and report.read_text(encoding="utf-8").strip()
-                    and done.is_file() and done.read_text(encoding="utf-8").strip()):
+            self._log(
+                f"methodology: analysis turn done (tools={res.tool_calls}, cost=${res.cost:.4f})"
+            )
+            if (
+                report.is_file()
+                and report.read_text(encoding="utf-8").strip()
+                and done.is_file()
+                and done.read_text(encoding="utf-8").strip()
+            ):
                 self._log(f"methodology: retrospective written -> {self._rel(report)}")
                 return
-            prompt = (f"The methodology analysis is incomplete. Write the retrospective to "
-                      f"{self._rel(report)} and a one-line completion note to {self._rel(done)}.")
+            prompt = (
+                f"The methodology analysis is incomplete. Write the retrospective to "
+                f"{self._rel(report)} and a one-line completion note to {self._rel(done)}."
+            )
         self._log("methodology: still incomplete after retries; continuing exit")

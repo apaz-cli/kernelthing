@@ -71,30 +71,6 @@ function block(cfg, name, vars, fallback) {
   return new GuardBlock(render(cfg, name, vars, fallback));
 }
 
-// --- goal-tracker immutable-section preservation ----------------------------
-
-function immutableSection(text) {
-  const lines = String(text || "").split("\n");
-  let capture = false;
-  const out = [];
-  for (const line of lines) {
-    if (/^## IMMUTABLE SECTION\s*$/.test(line)) { capture = true; continue; }
-    if (capture && (/^## MUTABLE SECTION\s*$/.test(line) || /^---\s*$/.test(line))) break;
-    if (capture) out.push(line);
-  }
-  return out.join("\n").trim();
-}
-
-// Returns true if the proposed new content keeps the immutable section intact
-// (or if the on-disk tracker has no immutable section -- legacy/None case).
-function immutablePreserved(trackerPath, newContent) {
-  let current = "";
-  try { current = fs.readFileSync(trackerPath, "utf8"); } catch { return true; }
-  const cur = immutableSection(current);
-  if (!cur) return true;
-  return cur === immutableSection(newContent);
-}
-
 function applyEdit(filePath, oldString, newString, replaceAll) {
   let content = "";
   try { content = fs.readFileSync(filePath, "utf8"); } catch { return null; }
@@ -213,22 +189,6 @@ function checkWriteLike(cfg, filePath, resultingContent) {
       "Modifying the plan file is forbidden during an active session.");
   }
 
-  // Goal tracker: only the active loop's, and (after round 0) only its mutable section.
-  if (nameLower === "goal-tracker.md") {
-    const correct = path.join(cfg.loopDir, "goal-tracker.md");
-    if (abs !== correct) {
-      return block(cfg, "goal-tracker-modification",
-        { CURRENT_ROUND: cfg.currentRound, CORRECT_PATH: correct },
-        "Write the goal tracker to the active loop directory only.");
-    }
-    if (cfg.currentRound > 0 && resultingContent != null && !immutablePreserved(correct, resultingContent)) {
-      return block(cfg, "goal-tracker-modification",
-        { CURRENT_ROUND: cfg.currentRound, CORRECT_PATH: correct },
-        "After round 0 you may change only the MUTABLE SECTION of the goal tracker.");
-    }
-    return null;
-  }
-
   // Summary / contract files.
   const isSummary = RE_SUMMARY.test(nameLower);
   const isContract = RE_CONTRACT.test(nameLower);
@@ -294,17 +254,6 @@ function checkRead(cfg, filePath) {
       "There is no active round contract during the finalize phase.");
   }
 
-  // Goal tracker must be the active loop's.
-  if (nameLower === "goal-tracker.md") {
-    const correct = path.join(cfg.loopDir, "goal-tracker.md");
-    if (abs !== correct) {
-      return block(cfg, "wrong-file-location",
-        { FILE_PATH: filePath, ACTIVE_LOOP_DIR: cfg.loopDir, CURRENT_ROUND: cfg.currentRound, CORRECT_PATH: correct },
-        `Read the active loop goal tracker: ${correct}`);
-    }
-    return null;
-  }
-
   // Round files (summary/prompt/contract) must come from the active loop dir.
   if (RE_ROUNDFILE.test(nameLower) && !inLoop(cfg, abs)) {
     return block(cfg, "wrong-file-location",
@@ -354,11 +303,6 @@ function checkBash(cfg, command) {
       { CORRECT_PATH: path.join(cfg.loopDir, `round-${cfg.currentRound}-contract.md`) },
       "Use the write/edit tool for round contracts, not bash redirection.");
   }
-  if (commandModifiesFile(c, "goal-tracker\\.md")) {
-    return block(cfg, "goal-tracker-bash-write",
-      { CORRECT_PATH: path.join(cfg.loopDir, "goal-tracker.md") },
-      "Use the write/edit tool for goal-tracker.md, not bash redirection.");
-  }
   // plan.md backup: only the copy living in the loop dir is protected.
   if (/\.humanize\b/.test(c) && commandModifiesFile(c, "plan\\.md")) {
     return block(cfg, "plan-backup-protected", {}, "The plan.md backup in the loop directory cannot be modified.");
@@ -400,7 +344,7 @@ export function decide(cfg, tool, args) {
     case "edit": {
       let resulting = null;
       const nameLower = lower(baseName(args.filePath || ""));
-      if (nameLower === "goal-tracker.md" || nameLower === "candidate-summary.md") {
+      if (nameLower === "candidate-summary.md") {
         resulting = applyEdit(absPath(cfg, args.filePath), args.oldString, args.newString, !!args.replaceAll);
       }
       return checkWriteLike(cfg, args.filePath, resulting);

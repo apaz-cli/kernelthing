@@ -11,6 +11,7 @@ kernelthing stays language/baseline-agnostic: it only runs the score command
 and reads that JSON. All paths the orchestrator uses are resolved relative to
 the enclosing git repo root (so worktrees and @file mentions work).
 """
+
 from __future__ import annotations
 
 import json
@@ -18,37 +19,39 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
 class Problem:
     name: str
-    repo_root: Path          # git toplevel == orchestrator working dir
-    rel_dir: str             # problem dir, relative to repo_root
-    plan: str                # repo-relative path to the plan
-    edit_files: list[str]    # repo-relative paths the agent may edit
+    repo_root: Path  # git toplevel == orchestrator working dir
+    rel_dir: str  # problem dir, relative to repo_root
+    plan: str  # repo-relative path to the plan
+    edit_files: list[str]  # repo-relative paths the agent may edit
     # Plain score command (cwd = <worktree>/<rel_dir>), used only when pygpubench
     # scoring is turned off (cfg.pygpubench=False); pygpubench problems may leave
     # it empty or point it at a self-test the agent runs.
     score_command: str = ""
     metric_name: str = "metric"
     unit: str = ""
-    direction: str = "maximize"   # or "minimize"
+    direction: str = "maximize"  # or "minimize"
     bench_runs: int = 3
     # pygpubench config: submission_qualname, task_module, generator,
     # test_args, repeats, seed, timeout, landlock/mseal/allow_root. See bench.py.
-    bench: dict = field(default_factory=dict)
+    bench: dict[str, Any] = field(default_factory=dict)
     # metric derivation for pygpubench: kind + (flops|baseline_qualname).
-    metric: dict = field(default_factory=dict)
+    metric: dict[str, Any] = field(default_factory=dict)
 
     @property
     def dir(self) -> Path:
         return self.repo_root / self.rel_dir
 
 
-def _git_toplevel(path: Path) -> Path:
-    r = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
-                       capture_output=True, text=True)
+def git_toplevel(path: Path) -> Path:
+    r = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"], capture_output=True, text=True
+    )
     if r.returncode != 0:
         raise RuntimeError(f"{path} is not inside a git repository")
     return Path(r.stdout.strip())
@@ -62,12 +65,12 @@ def load_problem(path: str | Path) -> Problem:
         raise FileNotFoundError(f"no problem.json at {manifest}")
     data = json.loads(manifest.read_text(encoding="utf-8"))
     prob_dir = manifest.parent
-    repo_root = _git_toplevel(prob_dir)
+    repo_root = git_toplevel(prob_dir)
     rel_dir = str(prob_dir.relative_to(repo_root))
 
     def repo_rel(rel_to_problem: str) -> str:
         # manifest paths are relative to the problem dir; make them repo-relative
-        return str((Path(rel_dir) / rel_to_problem)) if rel_dir != "." else rel_to_problem
+        return str(Path(rel_dir) / rel_to_problem) if rel_dir != "." else rel_to_problem
 
     return Problem(
         name=data["name"],
@@ -75,13 +78,13 @@ def load_problem(path: str | Path) -> Problem:
         rel_dir=rel_dir,
         plan=repo_rel(data["plan"]),
         edit_files=[repo_rel(f) for f in data["edit_files"]],
-        score_command=data["score_command"] if "score_command" in data else "",
-        metric_name=data["metric_name"] if "metric_name" in data else "metric",
-        unit=data["unit"] if "unit" in data else "",
-        direction=data["direction"] if "direction" in data else "maximize",
-        bench_runs=int(data["bench_runs"] if "bench_runs" in data else 3),
-        bench=dict(data["bench"] if "bench" in data else {}),
-        metric=dict(data["metric"] if "metric" in data else {}),
+        score_command=data.get("score_command", ""),
+        metric_name=data.get("metric_name", "metric"),
+        unit=data.get("unit", ""),
+        direction=data.get("direction", "maximize"),
+        bench_runs=int(data.get("bench_runs", 3)),
+        bench=dict(data.get("bench", {})),
+        metric=dict(data.get("metric", {})),
     )
 
 
@@ -101,18 +104,21 @@ def prepare_problem(problem: Problem, managed_root: Path) -> Problem:
         else:
             shutil.copy2(item, dest / item.name)
 
-    _rewrite_plan_for_worktree(dest, problem)
+    rewrite_plan_for_worktree(dest, problem)
 
-    subprocess.run(["git", "init", "-b", "main"], cwd=dest, check=True,
-                   capture_output=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=dest, check=True, capture_output=True)
     subprocess.run(["git", "add", "-A"], cwd=dest, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "--allow-empty", "-m", "initial problem"],
-                   cwd=dest, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "initial problem"],
+        cwd=dest,
+        check=True,
+        capture_output=True,
+    )
 
     return load_problem(dest / "problem.json")
 
 
-def _rewrite_plan_for_worktree(dest: Path, problem: Problem) -> None:
+def rewrite_plan_for_worktree(dest: Path, problem: Problem) -> None:
     """Update the copied plan.md for standalone worktree context.
 
     The source plan references the kernelthing repo layout (e.g. ``kernelthing
@@ -122,6 +128,7 @@ def _rewrite_plan_for_worktree(dest: Path, problem: Problem) -> None:
     notice so agents know where they are.
     """
     import sys
+
     plan_path = dest / problem.plan
     if not plan_path.is_file():
         return

@@ -5,10 +5,12 @@ embedded web server (a background thread) reads status and writes control
 (parallelism, stop). The loop reads control at dispatch boundaries, so N can be
 changed live and a stop takes effect after the in-flight candidates settle.
 """
+
 from __future__ import annotations
 
 import threading
 import time
+from typing import Any
 
 
 class LoopBus:
@@ -17,10 +19,10 @@ class LoopBus:
         self._parallelism = max(1, int(parallelism))
         self._wall_clock_s = max(0, int(wall_clock_s))
         self._max_candidates = max(0, int(max_candidates))
-        self._explore_bias = 50     # 0-100: 0=all exploit, 100=all explore
-        self._explore_auto = True   # when True, the orchestrator applies a schedule
+        self._explore_bias = 50  # 0-100: 0=all exploit, 100=all explore
+        self._explore_auto = True  # when True, the orchestrator applies a schedule
         self._stop = False
-        self._status: dict = {}
+        self._status: dict[str, Any] = {}
         self._log: list[str] = []
         self._log_cap = 400
 
@@ -83,7 +85,7 @@ class LoopBus:
             self._stop = True
 
     # --- status: written by the loop ---
-    def publish(self, **kw) -> None:
+    def publish(self, **kw: object) -> None:
         with self._lock:
             self._status.update(kw)
 
@@ -93,16 +95,16 @@ class LoopBus:
         Returns "" until the loop publishes one -- the web server can be polled
         before the first publish."""
         with self._lock:
-            return self._status.get("loop_dir", "")
+            return str(self._status.get("loop_dir", ""))
 
     def log(self, line: str) -> None:
         with self._lock:
             self._log.append(f"{time.strftime('%H:%M:%S')} {line}")
             if len(self._log) > self._log_cap:
-                self._log = self._log[-self._log_cap:]
+                self._log = self._log[-self._log_cap :]
 
     # --- snapshot: read by the UI ---
-    def snapshot(self) -> dict:
+    def snapshot(self) -> dict[str, Any]:
         with self._lock:
             snap = dict(self._status)
             snap["control"] = {

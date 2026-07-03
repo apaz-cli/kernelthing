@@ -30,6 +30,7 @@ and (3) ``chdir``-ing into it for the duration. Cached ``submission``/``task``/
 ``baseline`` modules are purged around each call so a later worktree never reuses
 an earlier one's code (same module name, different file on disk).
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -40,37 +41,48 @@ import re
 import signal
 import subprocess
 import sys
+import threading
+from collections.abc import Generator
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-_JSON_OBJ = re.compile(r"\{.*\}")
+from .problem import Problem
+
+# Protects the process-global CUDA_VISIBLE_DEVICES env var while a pygpubench
+# subprocess inherits it; the actual GPU work is already serialized per-device by
+# the per-GPU flock (gpulock.py), so this lock is held only for microseconds.
+_env_lock = threading.Lock()
+
+JSON_OBJ = re.compile(r"\{.*\}")
 
 # pygpubench raises ``RuntimeError('Benchmark subprocess failed with exit code N')``
 # when the supervised benchmark process dies. A *negative* N is Python's convention
 # for "killed by signal -N" -- the actionable signal hides inside the message.
-_EXIT_CODE = re.compile(r"exit code (-?\d+)")
+EXIT_CODE_RE = re.compile(r"exit code (-?\d+)")
 
 # Common ways a CUDA kernel takes down the benchmark subprocess, with the most
 # likely cause for this workload (kernel editing) so the agent gets a next step.
-_SIGNAL_HINT = {
+SIGNAL_HINT = {
     signal.SIGSEGV: "illegal memory access / out-of-bounds -- check indexing, "
-                    "launch grid/block bounds, and shared-memory sizes",
+    "launch grid/block bounds, and shared-memory sizes",
     signal.SIGABRT: "abort() -- often a failed CUDA API check or libc++ assertion "
-                    "(e.g. cudaErrorIllegalAddress surfaced at sync)",
+    "(e.g. cudaErrorIllegalAddress surfaced at sync)",
     signal.SIGKILL: "killed -- usually out-of-memory (host or GPU) or the sandbox "
-                    "timeout; reduce allocation or kernel runtime",
+    "timeout; reduce allocation or kernel runtime",
     signal.SIGBUS: "bus error -- misaligned access or bad memory mapping",
     signal.SIGFPE: "arithmetic fault -- integer divide-by-zero in index math",
     signal.SIGILL: "illegal instruction -- ABI/arch mismatch in the compiled kernel",
 }
 
 
-def _explain_bench_error(e: BaseException) -> str:
+def explain_bench_error(e: BaseException) -> str:
     """Turn pygpubench's bare ``exit code -11`` into a signal-named, actionable line.
 
     Falls back to the plain ``repr`` when the message has no decodable exit code
     (so non-crash failures -- import errors, timeouts already labelled, etc. -- are
     untouched)."""
-    m = _EXIT_CODE.search(str(e))
+    m = EXIT_CODE_RE.search(str(e))
     if not m:
         return f"pygpubench score error: {e!r}"
     code = int(m.group(1))
@@ -80,9 +92,11 @@ def _explain_bench_error(e: BaseException) -> str:
         sig = signal.Signals(-code)
     except ValueError:
         return f"pygpubench score error (killed by signal {-code}): {e!r}"
-    hint = _SIGNAL_HINT.get(sig, "subprocess crashed")
-    return (f"benchmark subprocess crashed: {sig.name} (signal {-code}) -- {hint}. "
-            "This is a fault inside the kernel/submission, not a kernelthing bug.")
+    hint = SIGNAL_HINT.get(sig, "subprocess crashed")
+    return (
+        f"benchmark subprocess crashed: {sig.name} (signal {-code}) -- {hint}. "
+        "This is a fault inside the kernel/submission, not a kernelthing bug."
+    )
 
 
 def parse_score(stdout: str) -> tuple[bool, float | None]:
@@ -95,7 +109,7 @@ def parse_score(stdout: str) -> tuple[bool, float | None]:
     for line in reversed(stdout.splitlines()):
         line = line.strip()
         if not (line.startswith("{") and line.endswith("}")):
-            m = _JSON_OBJ.search(line)
+            m = JSON_OBJ.search(line)
             if not m:
                 continue
             line = m.group(0)
@@ -112,6 +126,7 @@ def parse_score(stdout: str) -> tuple[bool, float | None]:
             return bool(obj["correct"]), metric
     return False, None
 
+
 # Module names we own in a problem dir; purged before/after each scoring so two
 # worktrees with the same module name but different files never alias.
 _PROBLEM_MODULES = ("submission", "task", "baseline")
@@ -119,15 +134,43 @@ _PROBLEM_MODULES = ("submission", "task", "baseline")
 # Benchmark defaults when the manifest's ``bench`` block omits them (the common
 # case -- a problem need only name its submission/baseline). A problem may
 # override any of them.
-DEFAULT_REPEATS = 5         # timed measurements per scoring (median is taken)
-DEFAULT_SEED = 0            # RNG seed handed to the test-case generator
-DEFAULT_TIMEOUT_S = 600     # per-benchmark wall-clock cap
+DEFAULT_REPEATS = 5  # timed measurements per scoring (median is taken)
+DEFAULT_SEED = 0  # RNG seed handed to the test-case generator
+DEFAULT_TIMEOUT_S = 600  # per-benchmark wall-clock cap
+
+
+@dataclass
+class _BenchSetup:
+    """Resolved benchmark configuration extracted from a problem manifest."""
+
+    bench_cfg: dict[str, Any]
+    prob_dir: Path
+    task_module: str
+    generator: str
+    test_args: dict[str, Any]
+    repeats: int
+    seed: int
+
+
+def resolve_bench_config(problem: Problem, worktree: Path) -> _BenchSetup:
+    """Extract benchmark configuration from a problem, with defaults."""
+    bench_cfg = problem.bench or {}
+    return _BenchSetup(
+        bench_cfg=bench_cfg,
+        prob_dir=Path(worktree) / problem.rel_dir,
+        task_module=bench_cfg.get("task_module", "task"),
+        generator=bench_cfg.get("generator", "generate_test_case"),
+        test_args=bench_cfg.get("test_args", {}),
+        repeats=int(bench_cfg.get("repeats", DEFAULT_REPEATS)),
+        seed=int(bench_cfg.get("seed", DEFAULT_SEED)),
+    )
 
 
 def available() -> bool:
     """True if pygpubench can be imported (it and torch are optional deps)."""
     try:
         import pygpubench  # noqa: F401
+
         return True
     except Exception:
         return False
@@ -140,7 +183,7 @@ def _purge_problem_modules() -> None:
 
 
 @contextlib.contextmanager
-def _importable(prob_dir: Path):
+def _importable(prob_dir: Path) -> Generator[None, None, None]:
     """Make ``prob_dir`` importable in-process and for spawned children."""
     prob_dir_str = str(prob_dir)
     old_cwd = os.getcwd()
@@ -148,7 +191,8 @@ def _importable(prob_dir: Path):
     _purge_problem_modules()
     sys.path.insert(0, prob_dir_str)
     os.environ["PYTHONPATH"] = os.pathsep.join(
-        [prob_dir_str, *(old_pp.split(os.pathsep) if old_pp else [])])
+        [prob_dir_str, *(old_pp.split(os.pathsep) if old_pp else [])]
+    )
     try:
         os.chdir(prob_dir_str)
         yield
@@ -163,13 +207,25 @@ def _importable(prob_dir: Path):
         _purge_problem_modules()
 
 
-def _do_bench(pygpubench, qualname, gen, args, repeats, seed, opts,
-              writable_paths=None):
+def do_bench(
+    pygpubench: Any,
+    qualname: str,
+    gen: _GeneratorAdapter,
+    args: dict[str, Any],
+    repeats: int,
+    seed: int,
+    opts: dict[str, Any],
+    writable_paths: list[str] | None = None,
+) -> Any:
     """One isolated benchmark; returns the BenchmarkResult or raises."""
     if writable_paths is None:
         writable_paths = list(opts.get("writable_paths", ["/tmp"]))
     return pygpubench.do_bench_isolated(
-        qualname, gen, dict(args), int(repeats), int(seed),
+        qualname,
+        gen,
+        dict(args),
+        int(repeats),
+        int(seed),
         discard=True,
         timeout=int(opts["timeout"]) if "timeout" in opts else DEFAULT_TIMEOUT_S,
         landlock=bool(opts["landlock"]) if "landlock" in opts else True,
@@ -195,6 +251,7 @@ def _do_bench(pygpubench, qualname, gen, args, repeats, seed, opts,
 # value into the output buffer.  The shim qualifies as the pygpubench
 # submission qualname and is cleaned up after scoring.
 
+
 class _GeneratorAdapter:
     """Adapts a natural generator to pygpubench's in-place protocol.
 
@@ -202,14 +259,14 @@ class _GeneratorAdapter:
     qualified name (e.g. ``task.generate_test_case``).
     """
 
-    def __init__(self, gen):
+    def __init__(self, gen: Any) -> None:
         self._gen = gen
 
-    def __call__(self, **kwargs):
-        import torch
+    def __call__(self, **kwargs: Any) -> Any:
+
         inputs, expected = self._gen(**kwargs)
         output = expected[0].new_empty(expected[0].size())
-        return (output,) + tuple(inputs), expected
+        return (output, *tuple(inputs)), expected
 
 
 def _shim_qualname(qualname: str, prob_dir: Path) -> tuple[str, Path]:
@@ -222,7 +279,7 @@ def _shim_qualname(qualname: str, prob_dir: Path) -> tuple[str, Path]:
     safe = qualname.replace(".", "_")
     shim_mod = f"_kt_shim_{safe}"
     shim_path = prob_dir / f"{shim_mod}.py"
-    shim_path.write_text(f'''\
+    shim_path.write_text(f"""\
 import torch
 import {module_name} as _real
 _orig = _real.{func_name}
@@ -230,7 +287,7 @@ def {func_name}(output, *args, **kwargs):
     result = _orig(*args, **kwargs)
     output.copy_(result)
     return output
-''')
+""")
     return f"{shim_mod}.{func_name}", shim_path
 
 
@@ -241,16 +298,45 @@ def _cleanup_shim(shim_path: Path) -> None:
             p.unlink()
 
 
-def _median_us(pygpubench, result) -> float | None:
+def median_us(pygpubench: Any, result: Any) -> float | None:
     if not result.success:
         return None
-    return pygpubench.basic_stats(result.time_us).median
+    return float(pygpubench.basic_stats(result.time_us).median)
 
 
-def _derive_metric(pygpubench, problem, gen, args, repeats, seed, opts,
-                   cand_median: float, *, baseline_shim_q: str = "",
-                   pinned_baseline: float | None = None,
-                   writable_paths=None) -> tuple[float | None, str | None]:
+@contextlib.contextmanager
+def _gpu_env(gpu_index: int) -> Generator[None, None, None]:
+    """Temporarily set ``CUDA_VISIBLE_DEVICES`` for a pygpubench subprocess to inherit.
+
+    The per-GPU flock serialises actual device work; this lock only serialises the
+    env-var mutation (microseconds), so two GPUs can bench concurrently.
+    """
+    old = os.environ.get("CUDA_VISIBLE_DEVICES")
+    with _env_lock:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+        try:
+            yield
+        finally:
+            if old is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = old
+
+
+def derive_metric(
+    pygpubench: Any,
+    problem: Problem,
+    gen: _GeneratorAdapter,
+    args: dict[str, Any],
+    repeats: int,
+    seed: int,
+    opts: dict[str, Any],
+    cand_median: float,
+    *,
+    baseline_shim_q: str = "",
+    pinned_baseline: float | None = None,
+    writable_paths: list[str] | None = None,
+) -> tuple[float | None, str | None]:
     """Turn the candidate's median time (us) into the problem's metric.
 
     kinds:
@@ -269,24 +355,26 @@ def _derive_metric(pygpubench, problem, gen, args, repeats, seed, opts,
     drifting with per-scoring GPU noise.
     """
     metric = problem.metric or {}
-    kind = metric["kind"] if "kind" in metric else "latency_us"
+    kind = metric.get("kind", "latency_us")
     if kind == "latency_us":
         return cand_median, None
     if kind == "tflops":
-        flops = metric["flops"] if "flops" in metric else None
+        flops = metric.get("flops", None)
         if not flops:
             return None, "metric.kind=tflops requires metric.flops"
         return float(flops) / (cand_median * 1e6), None
     if kind in ("pct_baseline", "speedup"):
+        base_median: float | None
         if pinned_baseline is not None:
             base_median = pinned_baseline
         else:
             base_q = baseline_shim_q or metric.get("baseline_qualname", "")
             if not base_q:
                 return None, f"metric.kind={kind} requires metric.baseline_qualname"
-            base_res = _do_bench(pygpubench, base_q, gen, args, repeats, seed, opts,
-                                 writable_paths=writable_paths)
-            base_median = _median_us(pygpubench, base_res)
+            base_res = do_bench(
+                pygpubench, base_q, gen, args, repeats, seed, opts, writable_paths=writable_paths
+            )
+            base_median = median_us(pygpubench, base_res)
             if base_median is None:
                 return None, f"baseline '{base_q}' failed: errors={base_res.errors}"
         ratio = base_median / cand_median
@@ -294,7 +382,9 @@ def _derive_metric(pygpubench, problem, gen, args, repeats, seed, opts,
     return None, f"unknown metric.kind '{kind}'"
 
 
-def measure_baseline(problem, worktree: Path) -> tuple[float | None, str | None]:
+def measure_baseline(
+    problem: Problem, worktree: Path, *, gpu_index: int = 0
+) -> tuple[float | None, str | None]:
     """Benchmark the baseline reference kernel once, returning ``(median_us, err)``.
 
     The baseline (e.g. ``torch.matmul``) is the fixed denominator for
@@ -309,42 +399,44 @@ def measure_baseline(problem, worktree: Path) -> tuple[float | None, str | None]
     """
     try:
         import pygpubench
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return None, f"pygpubench not installed: {e!r}"
 
     base_q = (problem.metric or {}).get("baseline_qualname", "")
     if not base_q:
         return None, None
-    bench = problem.bench or {}
-    prob_dir = Path(worktree) / problem.rel_dir
-    if not prob_dir.is_dir():
-        return None, f"problem dir not found in worktree: {prob_dir}"
-
-    task_module = bench["task_module"] if "task_module" in bench else "task"
-    generator = bench["generator"] if "generator" in bench else "generate_test_case"
-    test_args = bench["test_args"] if "test_args" in bench else {}
-    repeats = int(bench["repeats"] if "repeats" in bench else DEFAULT_REPEATS)
-    seed = int(bench["seed"] if "seed" in bench else DEFAULT_SEED)
+    s = resolve_bench_config(problem, worktree)
+    if not s.prob_dir.is_dir():
+        return None, f"problem dir not found in worktree: {s.prob_dir}"
 
     try:
-        with _importable(prob_dir):
-            task_mod = importlib.import_module(task_module)
-            gen = _GeneratorAdapter(getattr(task_mod, generator))
-            base_shim_q, base_shim_path = _shim_qualname(base_q, prob_dir)
+        with _importable(s.prob_dir):
+            task_mod = importlib.import_module(s.task_module)
+            gen = _GeneratorAdapter(getattr(task_mod, s.generator))
+            base_shim_q, base_shim_path = _shim_qualname(base_q, s.prob_dir)
             try:
-                res = _do_bench(pygpubench, base_shim_q, gen, test_args, repeats, seed,
-                                bench, writable_paths=[str(prob_dir)])
-                median = _median_us(pygpubench, res)
+                with _gpu_env(gpu_index):
+                    res = do_bench(
+                        pygpubench,
+                        base_shim_q,
+                        gen,
+                        s.test_args,
+                        s.repeats,
+                        s.seed,
+                        s.bench_cfg,
+                        writable_paths=[str(s.prob_dir)],
+                    )
+                median = median_us(pygpubench, res)
                 if median is None:
                     return None, f"baseline '{base_q}' failed: errors={res.errors}"
                 return median, None
             finally:
                 _cleanup_shim(base_shim_path)
-    except Exception as e:  # noqa: BLE001
-        return None, _explain_bench_error(e)
+    except Exception as e:
+        return None, explain_bench_error(e)
 
 
-def warm_build(problem, worktree: Path, *, timeout: int = 60) -> None:
+def warm_build(problem: Problem, worktree: Path, *, timeout: int = 60) -> None:
     """Trigger compilation of the worktree's kernel in a subprocess outside the GPU
     lock, so the real benchmark only pays runtime, not compile time.
 
@@ -360,7 +452,7 @@ def warm_build(problem, worktree: Path, *, timeout: int = 60) -> None:
     prob_dir = Path(worktree) / problem.rel_dir
     if not prob_dir.is_dir():
         return
-    try:
+    with contextlib.suppress(Exception):
         subprocess.run(
             [sys.executable, "-c", "import submission"],
             cwd=str(prob_dir),
@@ -368,12 +460,11 @@ def warm_build(problem, worktree: Path, *, timeout: int = 60) -> None:
             timeout=timeout,
             env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
         )
-    except Exception:
-        pass   # best-effort
 
 
-def score(problem, worktree: Path, *,
-          baseline_median: float | None = None) -> tuple[bool, float | None, str | None]:
+def score(
+    problem: Problem, worktree: Path, *, baseline_median: float | None = None, gpu_index: int = 0
+) -> tuple[bool, float | None, str | None]:
     """Benchmark the worktree's submission through pygpubench.
 
     Returns ``(correct, metric, err)`` -- the same tuple the legacy
@@ -386,61 +477,73 @@ def score(problem, worktree: Path, *,
     ``speedup`` metrics. When given, the baseline reference kernel is NOT
     re-benchmarked here -- the run measures it once (``measure_baseline``) and
     reuses it so every candidate is scored against one fixed baseline.
+
+    ``gpu_index``: set ``CUDA_VISIBLE_DEVICES`` for the pygpubench subprocess.
     """
     try:
         import pygpubench
-    except Exception as e:  # noqa: BLE001
-        return False, None, (
-            "pygpubench not installed (pip install 'kernelthing[pygpubench]'): "
-            f"{e!r}")
+    except Exception as e:
+        return (
+            False,
+            None,
+            (f"pygpubench not installed (pip install 'kernelthing[pygpubench]'): {e!r}"),
+        )
 
-    bench = problem.bench or {}
-    qualname = bench["submission_qualname"] if "submission_qualname" in bench else None
+    qualname = (problem.bench or {}).get("submission_qualname")
     if not qualname:
         return False, None, "problem.bench.submission_qualname is required"
-    prob_dir = Path(worktree) / problem.rel_dir
-    if not prob_dir.is_dir():
-        return False, None, f"problem dir not found in worktree: {prob_dir}"
-
-    task_module = bench["task_module"] if "task_module" in bench else "task"
-    generator = bench["generator"] if "generator" in bench else "generate_test_case"
-    test_args = bench["test_args"] if "test_args" in bench else {}
-    repeats = int(bench["repeats"] if "repeats" in bench else DEFAULT_REPEATS)
-    seed = int(bench["seed"] if "seed" in bench else DEFAULT_SEED)
+    s = resolve_bench_config(problem, worktree)
+    if not s.prob_dir.is_dir():
+        return False, None, f"problem dir not found in worktree: {s.prob_dir}"
 
     try:
-        with _importable(prob_dir):
-            task_mod = importlib.import_module(task_module)
-            gen_raw = getattr(task_mod, generator)
-            gen = _GeneratorAdapter(gen_raw)
+        with _importable(s.prob_dir):
+            task_mod = importlib.import_module(s.task_module)
+            gen = _GeneratorAdapter(getattr(task_mod, s.generator))
 
-            # Adapt qualnames to pygpubench's in-place protocol.
-            sub_shim_q, sub_shim_path = _shim_qualname(qualname, prob_dir)
+            sub_shim_q, sub_shim_path = _shim_qualname(qualname, s.prob_dir)
             base_shim_q = ""
             base_shim_path = None
             base_q = (problem.metric or {}).get("baseline_qualname", "")
-            # Skip shimming the baseline when its time is already pinned -- nothing
-            # in this call will re-benchmark it.
             if base_q and baseline_median is None:
-                base_shim_q, base_shim_path = _shim_qualname(base_q, prob_dir)
+                base_shim_q, base_shim_path = _shim_qualname(base_q, s.prob_dir)
 
             try:
-                writable = [str(prob_dir)]
-                cand_res = _do_bench(pygpubench, sub_shim_q, gen, test_args, repeats, seed, bench,
-                                     writable_paths=writable)
-                cand_median = _median_us(pygpubench, cand_res)
+                writable = [str(s.prob_dir)]
+                with _gpu_env(gpu_index):
+                    cand_res = do_bench(
+                        pygpubench,
+                        sub_shim_q,
+                        gen,
+                        s.test_args,
+                        s.repeats,
+                        s.seed,
+                        s.bench_cfg,
+                        writable_paths=writable,
+                    )
+                cand_median = median_us(pygpubench, cand_res)
                 if cand_median is None:
                     return False, None, f"submission failed correctness: errors={cand_res.errors}"
-                metric, err = _derive_metric(
-                    pygpubench, problem, gen, test_args, repeats, seed, bench,
-                    cand_median, baseline_shim_q=base_shim_q,
-                    pinned_baseline=baseline_median, writable_paths=writable)
+                with _gpu_env(gpu_index):
+                    metric, err = derive_metric(
+                        pygpubench,
+                        problem,
+                        gen,
+                        s.test_args,
+                        s.repeats,
+                        s.seed,
+                        s.bench_cfg,
+                        cand_median,
+                        baseline_shim_q=base_shim_q,
+                        pinned_baseline=baseline_median,
+                        writable_paths=writable,
+                    )
                 if err:
-                    return True, None, err   # ran + correct, but metric underivable
+                    return True, None, err
                 return True, metric, None
             finally:
                 _cleanup_shim(sub_shim_path)
                 if base_shim_path:
                     _cleanup_shim(base_shim_path)
-    except Exception as e:  # noqa: BLE001
-        return False, None, _explain_bench_error(e)
+    except Exception as e:
+        return False, None, explain_bench_error(e)

@@ -22,7 +22,7 @@ dependencies = [
 # ``--no-pygpubench`` bypasses it for command-scored problems.
 [project.optional-dependencies]
 # Test / development tooling.
-dev = ["pytest"]
+dev = ["pytest", "ruff>=0.11.0", "mypy>=1.14"]
 
 [project.scripts]
 kernelthing = "kernelthing.cli:main"
@@ -37,3 +37,25 @@ kernelthing = ["oc_guard/*.js", "oc_guard/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "T20", "Q", "RUF", "SIM", "C4"]
+# T201: print() to stderr is the intended logger for this CLI tool
+# E501: line length is enforced by the formatter; the webui inline HTML/JS is exempt
+ignore = ["T201", "E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# The inline web UI is a single minified HTML/CSS/JS string; length rules don't apply.
+"kernelthing/webui.py" = ["E501", "SIM102", "RUF001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["kernelthing"]
+
+[tool.mypy]
+strict = true
+exclude = ["tests/", "build/", ".venv/", "sandbox/", "vendor/", "problems/"]
+ignore_missing_imports = true
+disallow_untyped_defs = true

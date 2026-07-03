@@ -19,13 +19,16 @@ Endpoints:
   * ``GET  /api/candlog?file=`` -- one agent's full transcript (basename-restricted)
   * ``POST /api/control`` -- stop / set parallelism / set turn cap
 """
+
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from .bus import LoopBus
 
@@ -364,7 +367,7 @@ poll();
 </script></body></html>"""
 
 
-def _tail_text(path: Path, nbytes: int = 262144) -> str:
+def tail_text(path: Path, nbytes: int = 262144) -> str:
     """Read the last ``nbytes`` of a file as text, dropping a partial first line."""
     try:
         size = path.stat().st_size
@@ -380,37 +383,50 @@ def _tail_text(path: Path, nbytes: int = 262144) -> str:
     return txt
 
 
-def _tool_line(part: dict) -> str:
+def tool_line(part: dict[str, Any]) -> str:
     """One readable line for a tool event: name + its salient argument.
 
     opencode nests the call args under ``part.state.input`` (e.g. a read tool is
     ``{"tool":"read","state":{"input":{"filePath":...}}}``); only some shapes put
     them at ``part.input``. Check both, else the line is just the bare tool name."""
-    name = part["tool"] if "tool" in part else (part["name"] if "name" in part else "tool")
+    name = part.get("tool") or part.get("name", "tool")
     state = part["state"] if isinstance(part.get("state"), dict) else {}
-    inp = state["input"] if isinstance(state.get("input"), dict) else (
-        part["input"] if isinstance(part.get("input"), dict) else {})
+    inp = (
+        state["input"]
+        if isinstance(state.get("input"), dict)
+        else (part["input"] if isinstance(part.get("input"), dict) else {})
+    )
     arg = ""
-    for key in ("command", "filePath", "file_path", "path", "pattern",
-                "url", "query", "description", "prompt"):
+    for key in (
+        "command",
+        "filePath",
+        "file_path",
+        "path",
+        "pattern",
+        "url",
+        "query",
+        "description",
+        "prompt",
+    ):
         if inp.get(key):
             arg = inp[key]
             break
     return " ".join((str(name) + " " + str(arg)).split())
 
 
-def _is_tool(d: dict, part: dict) -> bool:
-    return d["type"] in ("tool", "tool_use") or \
-           ("type" in part and part["type"] in ("tool", "tool-invocation"))
+def is_tool(d: dict[str, Any], part: dict[str, Any]) -> bool:
+    return d["type"] in ("tool", "tool_use") or (
+        "type" in part and part["type"] in ("tool", "tool-invocation")
+    )
 
 
-def _summarize_agent_log(path: Path) -> dict:
+def summarize_agent_log(path: Path) -> dict[str, Any]:
     """Live summary of an agent's NDJSON log for its card: tool count, latest
     tool call, latest reasoning line, and accumulated cost."""
-    out = {"tools": 0, "cost": 0.0, "last_tool": "", "last_text": ""}
+    out: dict[str, Any] = {"tools": 0, "cost": 0.0, "last_tool": "", "last_text": ""}
     if not path.is_file():
         return out
-    for line in _tail_text(path).splitlines():
+    for line in tail_text(path).splitlines():
         line = line.strip()
         if not line:
             continue
@@ -421,19 +437,19 @@ def _summarize_agent_log(path: Path) -> dict:
         part = d["part"] if "part" in d and isinstance(d["part"], dict) else {}
         if d["type"] == "text" and "text" in part and part["text"]:
             out["last_text"] = " ".join(part["text"].split())[:160]
-        elif _is_tool(d, part):
+        elif is_tool(d, part):
             out["tools"] += 1
-            line_txt = _tool_line(part)
+            line_txt = tool_line(part)
             if line_txt:
                 out["last_tool"] = line_txt[:160]
         elif d["type"] == "step_finish":
-            if "cost" in part and part["cost"]:
+            if part.get("cost"):
                 out["cost"] = part["cost"]
     out["cost"] = round(float(out["cost"] or 0.0), 4)
     return out
 
 
-def _candlog_text(path: Path, lines: int = 400) -> str:
+def candlog_text(path: Path, lines: int = 400) -> str:
     """Full readable transcript of an agent's NDJSON log (text + tool lines)."""
     if not path.is_file():
         return "(no log yet)"
@@ -449,17 +465,17 @@ def _candlog_text(path: Path, lines: int = 400) -> str:
         part = d["part"] if "part" in d and isinstance(d["part"], dict) else {}
         if d["type"] == "text" and "text" in part and part["text"]:
             out.append("· " + " ".join(part["text"].split()))
-        elif _is_tool(d, part):
-            out.append("$ " + (_tool_line(part) or "tool"))
+        elif is_tool(d, part):
+            out.append("$ " + (tool_line(part) or "tool"))
     return "\n".join(out[-lines:]) or "(no text yet)"
 
 
-def _make_handler(bus: LoopBus):
+def make_handler(bus: LoopBus) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:  # silence
             pass
 
-        def _send(self, code, body, ctype="application/json"):
+        def _send(self, code: int, body: str | bytes, ctype: str = "application/json") -> None:
             data = body.encode() if isinstance(body, str) else body
             self.send_response(code)
             self.send_header("Content-Type", ctype)
@@ -467,7 +483,7 @@ def _make_handler(bus: LoopBus):
             self.end_headers()
             self.wfile.write(data)
 
-        def do_GET(self):
+        def do_GET(self) -> None:
             u = urlparse(self.path)
             if u.path == "/":
                 self._send(200, PAGE, "text/html; charset=utf-8")
@@ -480,12 +496,16 @@ def _make_handler(bus: LoopBus):
                     for a in snap.get("agents", []):
                         lf = a["log_file"]
                         if lf:
-                            a.update(_summarize_agent_log(loop_dir / Path(lf).name))
+                            a.update(summarize_agent_log(loop_dir / Path(lf).name))
                 self._send(200, json.dumps(snap))
             elif u.path == "/api/log":
                 loop_dir = Path(bus.loop_dir())
                 lf = loop_dir / "loop.log"
-                txt = lf.read_text(encoding="utf-8", errors="replace") if lf.is_file() else "(no log yet)"
+                txt = (
+                    lf.read_text(encoding="utf-8", errors="replace")
+                    if lf.is_file()
+                    else "(no log yet)"
+                )
                 self._send(200, txt, "text/plain; charset=utf-8")
             elif u.path == "/api/candlog":
                 q = parse_qs(u.query)
@@ -493,14 +513,18 @@ def _make_handler(bus: LoopBus):
                 name = (q.get("file") or [""])[0]
                 # restrict to the loop dir, basename only (no traversal)
                 target = loop_dir / Path(name).name if str(loop_dir) and name else None
-                self._send(200, _candlog_text(target) if target else "(no file)",
-                           "text/plain; charset=utf-8")
+                self._send(
+                    200,
+                    candlog_text(target) if target else "(no file)",
+                    "text/plain; charset=utf-8",
+                )
             else:
                 self._send(404, "not found", "text/plain")
 
-        def do_POST(self):
+        def do_POST(self) -> None:
             if urlparse(self.path).path != "/api/control":
-                self._send(404, "not found", "text/plain"); return
+                self._send(404, "not found", "text/plain")
+                return
             n = int(self.headers.get("Content-Length", 0))
             try:
                 body = json.loads(self.rfile.read(n) or b"{}")
@@ -510,25 +534,26 @@ def _make_handler(bus: LoopBus):
                 bus.set_parallelism(body["parallelism"])
             if "wall_clock" in body:
                 from .config import parse_duration
-                try:
+
+                with contextlib.suppress(ValueError, TypeError):
                     bus.set_wall_clock(parse_duration(body["wall_clock"]))
-                except (ValueError, TypeError):
-                    pass   # ignore unparseable input; UI keeps the prior limit
             if "explore_bias" in body:
                 bus.set_explore_bias(body["explore_bias"])
             if "explore_auto" in body:
                 bus.set_explore_auto()
             if "max_candidates" in body:
                 bus.set_max_candidates(body["max_candidates"])
-            if "stop" in body and body["stop"]:
+            if body.get("stop"):
                 bus.request_stop()
             self._send(200, json.dumps({"ok": True}))
 
     return Handler
 
 
-def start_server(bus: LoopBus, port: int = 8765, host: str = "127.0.0.1"):
+def start_server(
+    bus: LoopBus, port: int = 8765, host: str = "127.0.0.1"
+) -> tuple[ThreadingHTTPServer, int]:
     """Start the web UI in a daemon thread; returns (httpd, actual_port)."""
-    httpd = ThreadingHTTPServer((host, port), _make_handler(bus))
+    httpd = ThreadingHTTPServer((host, port), make_handler(bus))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, httpd.server_address[1]

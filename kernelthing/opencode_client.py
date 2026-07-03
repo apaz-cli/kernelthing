@@ -8,6 +8,7 @@ opencode 1.15.13 facts this relies on (see README):
 - ``-s <id>`` continues a session; ``--dangerously-skip-permissions`` auto-approves
   tool use (safe only because the run is bwrap-sandboxed).
 """
+
 from __future__ import annotations
 
 import json
@@ -16,15 +17,16 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from . import sandbox
 
 # The PreToolUse guard plugin and the block-message templates it renders.
-_GUARD_PLUGIN = Path(__file__).resolve().parent / "oc_guard" / "guard.js"
-_GUARD_BLOCK_DIR = Path(__file__).resolve().parent.parent / "prompts" / "block"
+GUARD_PLUGIN = Path(__file__).resolve().parent / "oc_guard" / "guard.js"
+GUARD_BLOCK_DIR = Path(__file__).resolve().parent.parent / "prompts" / "block"
 
 
-def _opencode_state_dirs() -> list[Path]:
+def opencode_state_dirs() -> list[Path]:
     """opencode's own writable state dirs (kept writable inside the sandbox)."""
     home = Path(os.path.expanduser("~"))
     xdg_data = Path(os.environ.get("XDG_DATA_HOME", home / ".local" / "share"))
@@ -42,17 +44,17 @@ class OpencodeResult:
     text: str
     session_id: str | None
     cost: float
-    tokens: dict
+    tokens: dict[str, Any]
     exit_code: int
     tool_calls: int = 0
     raw_lines: list[str] = field(default_factory=list)
 
 
-def _parse_ndjson(stdout: str) -> tuple[str, str | None, float, dict, int]:
+def parse_ndjson(stdout: str) -> tuple[str, str | None, float, dict[str, Any], int]:
     text_parts: list[str] = []
     session_id: str | None = None
     cost = 0.0
-    tokens: dict = {}
+    tokens: dict[str, Any] = {}
     tool_calls = 0
     for line in stdout.splitlines():
         line = line.strip()
@@ -67,14 +69,50 @@ def _parse_ndjson(stdout: str) -> tuple[str, str | None, float, dict, int]:
         part = ev["part"] if "part" in ev and isinstance(ev["part"], dict) else {}
         if etype == "text" and "text" in part:
             text_parts.append(part["text"])
-        elif etype in ("tool", "tool_use") or ("type" in part and part["type"] in ("tool", "tool-invocation")):
+        elif etype in ("tool", "tool_use") or (
+            "type" in part and part["type"] in ("tool", "tool-invocation")
+        ):
             tool_calls += 1
         elif etype == "step_finish":
-            if "cost" in part and part["cost"]:
+            if part.get("cost"):
                 cost = part["cost"]
-            if "tokens" in part and part["tokens"]:
+            if part.get("tokens"):
                 tokens = part["tokens"]
     return "".join(text_parts), session_id, cost, tokens, tool_calls
+
+
+def build_opencode_env(
+    *,
+    gpu_index: int,
+    gpu_lock: Path | None = None,
+    data_dir: Path | None = None,
+    guard: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[Path]]:
+    """Build the env dict and opencode state dirs shared by run/run_interactive."""
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["KERNELTHING_GPU_INDEX"] = str(gpu_index)
+    if gpu_lock is not None:
+        env["KERNELTHING_GPU_LOCK"] = str(gpu_lock)
+
+    oc_config: dict[str, Any] = {"snapshot": False}
+    if guard is not None:
+        guard_cfg = dict(guard)
+        guard_cfg.setdefault("blockDir", str(GUARD_BLOCK_DIR))
+        env["KERNELTHING_GUARD"] = json.dumps(guard_cfg)
+        oc_config["plugin"] = [str(GUARD_PLUGIN)]
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(oc_config)
+
+    if data_dir is not None:
+        data_dir = Path(data_dir)
+        oc_state = [data_dir / "share", data_dir / "state", data_dir / "cache"]
+    else:
+        oc_state = opencode_state_dirs()
+    env["XDG_DATA_HOME"] = str(oc_state[0])
+    env["XDG_STATE_HOME"] = str(oc_state[1])
+    env["XDG_CACHE_HOME"] = str(oc_state[2])
+
+    return env, oc_state
 
 
 def run_interactive(
@@ -114,22 +152,7 @@ def run_interactive(
     if prompt:
         inner += ["--prompt", prompt]
 
-    # GPU mutex wrapper: bound after --tmpfs /tmp so it reaches through the mask
-    env = dict(os.environ)
-    env["CUDA_VISIBLE_DEVICES"] = ""
-    env["KERNELTHING_GPU_INDEX"] = str(gpu_index)
-    if gpu_lock is not None:
-        env["KERNELTHING_GPU_LOCK"] = str(gpu_lock)
-    # Disable opencode's snapshot feature (see ``run`` for why it is so costly here).
-    env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"snapshot": False})
-    if data_dir is not None:
-        data_dir = Path(data_dir)
-        oc_state = [data_dir / "share", data_dir / "state", data_dir / "cache"]
-        env["XDG_DATA_HOME"] = str(oc_state[0])
-        env["XDG_STATE_HOME"] = str(oc_state[1])
-        env["XDG_CACHE_HOME"] = str(oc_state[2])
-    else:
-        oc_state = _opencode_state_dirs()
+    env, oc_state = build_opencode_env(gpu_index=gpu_index, gpu_lock=gpu_lock, data_dir=data_dir)
 
     argv = sandbox.wrap(
         inner,
@@ -140,7 +163,6 @@ def run_interactive(
         ncu=ncu,
         gpu_lock=gpu_lock,
     )
-    # Inherit the tty (stdin/stdout/stderr = None) so the user interacts directly.
     return subprocess.run(argv, env=env).returncode
 
 
@@ -157,7 +179,7 @@ def run(
     log_path: Path | None = None,
     data_dir: Path | None = None,
     extra_writable: list[Path] | tuple[Path, ...] = (),
-    guard: dict | None = None,
+    guard: dict[str, Any] | None = None,
     ncu: bool = True,
     gpu_lock: Path | None = None,
 ) -> OpencodeResult:
@@ -185,20 +207,18 @@ def run(
         raise FileNotFoundError("opencode not found on PATH")
 
     inner = [
-        opencode, "run",
-        "--format", "json",
-        "-m", model,
+        opencode,
+        "run",
+        "--format",
+        "json",
+        "-m",
+        model,
         "--dangerously-skip-permissions",
-        "--dir", str(Path(working_dir).resolve()),
+        "--dir",
+        str(Path(working_dir).resolve()),
     ]
     if session:
         inner += ["-s", session]
-
-    env = dict(os.environ)
-    env["CUDA_VISIBLE_DEVICES"] = ""
-    env["KERNELTHING_GPU_INDEX"] = str(gpu_index)
-    if gpu_lock is not None:
-        env["KERNELTHING_GPU_LOCK"] = str(gpu_lock)
 
     # Force opencode's snapshot/checkpoint feature OFF. It git-adds the ENTIRE
     # working dir on every edit into a repo under .humanize/oc-data -- which lives
@@ -208,22 +228,9 @@ def run(
     # snapshots are pure overhead. The repo's opencode.json (snapshot:false) can't
     # reach the agent -- it runs in the per-worktree problem repo and we override
     # config via OPENCODE_CONFIG_CONTENT here -- so set it inline.
-    oc_config: dict = {"snapshot": False}
-    if guard is not None:
-        guard_cfg = dict(guard)
-        guard_cfg.setdefault("blockDir", str(_GUARD_BLOCK_DIR))
-        env["KERNELTHING_GUARD"] = json.dumps(guard_cfg)
-        oc_config["plugin"] = [str(_GUARD_PLUGIN)]
-    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(oc_config)
-
-    if data_dir is not None:
-        data_dir = Path(data_dir)
-        oc_state = [data_dir / "share", data_dir / "state", data_dir / "cache"]
-        env["XDG_DATA_HOME"] = str(oc_state[0])
-        env["XDG_STATE_HOME"] = str(oc_state[1])
-        env["XDG_CACHE_HOME"] = str(oc_state[2])
-    else:
-        oc_state = _opencode_state_dirs()
+    env, oc_state = build_opencode_env(
+        gpu_index=gpu_index, gpu_lock=gpu_lock, data_dir=data_dir, guard=guard
+    )
 
     argv = sandbox.wrap(
         inner,
@@ -252,8 +259,12 @@ def run(
     try:
         with open(prompt_name) as stdin_fh, open(out_name, "w") as out_fh:
             proc = subprocess.Popen(
-                argv, stdin=stdin_fh, stdout=out_fh,
-                stderr=subprocess.PIPE, text=True, env=env,
+                argv,
+                stdin=stdin_fh,
+                stdout=out_fh,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
             )
             try:
                 proc.communicate(timeout=timeout)
@@ -270,7 +281,7 @@ def run(
     if log_path is None:
         os.unlink(out_name)
 
-    text, sid, cost, tokens, tool_calls = _parse_ndjson(stdout)
+    text, sid, cost, tokens, tool_calls = parse_ndjson(stdout)
     return OpencodeResult(
         text=text,
         session_id=sid,
