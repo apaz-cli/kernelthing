@@ -221,36 +221,76 @@ def test_no_config_allows_everything(tmp_path):
     assert not r["blocked"]
 
 
-# --- shared-GPU lock enforcement (bash) -------------------------------------
+# --- GPU allocation hardening (bash) ----------------------------------------
+# GPU access is mediated by the libktgpu.so LD_PRELOAD shim (auto-assigns a
+# locked card on first CUDA use). Running GPU tools directly is fine now; what is
+# blocked is any attempt to touch or inspect the allocation machinery.
 
 
-def test_bash_ncu_unlocked_blocked(tmp_path):
+def test_bash_ncu_runs_unwrapped(tmp_path):
+    # No wrapper needed anymore -- the shim assigns a card transparently.
     cfg = _cfg(tmp_path)
     r = _decide(cfg, "bash", {"command": "/usr/local/cuda/bin/ncu --set full ./bench"})
-    assert r["blocked"] and "gpu" in r["message"].lower()
-
-
-def test_bash_nsys_unlocked_blocked(tmp_path):
-    cfg = _cfg(tmp_path)
-    r = _decide(cfg, "bash", {"command": "nsys profile ./bench"})
-    assert r["blocked"]
-
-
-def test_bash_ncu_wrapped_allowed(tmp_path):
-    cfg = _cfg(tmp_path)
-    r = _decide(cfg, "bash", {"command": "flock /tmp/kt-gpu.lock ncu --set full ./bench"})
     assert not r["blocked"]
 
 
-def test_bash_gpu_run_wrapped_allowed(tmp_path):
+def test_bash_nsys_runs_unwrapped(tmp_path):
     cfg = _cfg(tmp_path)
-    r = _decide(cfg, "bash", {"command": "/x/gpu_run.sh ncu --set full ./bench"})
+    r = _decide(cfg, "bash", {"command": "nsys profile ./bench"})
+    assert not r["blocked"]
+
+
+def test_bash_bench_runs_unwrapped(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "python3 -c 'import torch; torch.randn(8).cuda()'"})
+    assert not r["blocked"]
+
+
+def test_bash_set_cuda_visible_devices_blocked(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "CUDA_VISIBLE_DEVICES=0 python3 train.py"})
+    assert r["blocked"] and "gpu" in r["message"].lower()
+
+
+def test_bash_unset_cuda_visible_devices_blocked(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "unset CUDA_VISIBLE_DEVICES && ./bench"})
+    assert r["blocked"]
+
+
+def test_bash_ld_preload_override_blocked(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "LD_PRELOAD= python3 bench.py"})
+    assert r["blocked"]
+
+
+def test_bash_read_shim_blocked(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "cat /x/libktgpu.so | strings"})
+    assert r["blocked"]
+
+
+def test_bash_read_guard_blocked(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "cat kernelthing/oc_guard/guard_core.js"})
+    assert r["blocked"]
+
+
+def test_bash_bare_printenv_blocked(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "printenv"})
+    assert r["blocked"]
+
+
+def test_bash_env_prefix_allowed(tmp_path):
+    # `env FOO=bar cmd` is a normal invocation and must not be mistaken for a dump.
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "env OMP_NUM_THREADS=8 ./bench"})
     assert not r["blocked"]
 
 
 def test_bash_ncu_report_parser_not_blocked(tmp_path):
-    # The CPU-only report parser lives under ncu-report-skill/ -- must NOT trip the
-    # GPU-tool matcher (it never touches the device).
+    # The CPU-only report parser lives under ncu-report-skill/ -- pure CPU work.
     cfg = _cfg(tmp_path)
     r = _decide(
         cfg,

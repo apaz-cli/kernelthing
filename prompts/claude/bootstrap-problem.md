@@ -43,7 +43,7 @@ possible you must author:
      },
      "metric_name": "pct_baseline",                // short label for logs/UI
      "unit": "%cuBLAS",                            // display unit
-     "direction": "maximize"                       // maximize (throughput) | minimize (time/latency)
+     "direction": "maximize"                       // pct_baseline/speedup/tflops: maximize; latency_us: minimize
    }
    ```
 
@@ -163,7 +163,9 @@ is correct: from inside `{{TARGET_DIR}}` run
 
     kernelthing score .
 
-and confirm it prints `"correct": true` with a sane metric. This is the exact
+and confirm it prints `"correct": true` with a sane metric. Also **verify
+`direction`**: a faster kernel must move the metric the way `direction` rewards; if
+not, fix `direction` before finishing. This is the exact
 `bench.score` call that gates this bootstrap turn and scores every loop round —
 it benchmarks the submission through pygpubench, checks it against `expected`
 within `atol`/`rtol`, and (for `pct_baseline`/`speedup`) does the same for

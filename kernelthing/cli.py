@@ -245,8 +245,7 @@ def score_command(argv: list[str]) -> int:
     model as the default device (``CUDA_VISIBLE_DEVICES``/GPU 0) is used, falling
     back to a blocking lock on GPU 0 if all are busy.
     """
-    from . import bench
-    from . import gpulock
+    from . import bench, gpulock
 
     p = argparse.ArgumentParser(
         prog="kernelthing score",
@@ -298,8 +297,11 @@ def score_command(argv: list[str]) -> int:
                 model=gpulock.gpu_name(default_index),
                 arch=gpulock.gpu_architecture(default_index),
             )
-    with gpulock.gpu_lock(gpu):
-        correct, metric, err = bench.score(problem, problem.repo_root, gpu_index=gpu)
+    # GPU access is serialized inside bench.score: it hands pygpubench's isolated
+    # worker the libktgpu.so LD_PRELOAD shim, which flocks a card for that worker's
+    # lifetime. No in-process flock here -- taking one would deadlock against the
+    # shim's flock on the same lockfile.
+    correct, metric, err = bench.score(problem, problem.repo_root, gpu_index=gpu)
     result = {"correct": correct, "metric": metric, "unit": problem.unit, "error": err}
     print(json.dumps(result))
     return 0 if correct else 1

@@ -191,6 +191,19 @@ def discover_gpus() -> list[dict[str, object]]:
     return []
 
 
+def gpu_pool_spec(indices: list[int]) -> str:
+    """Serialize a GPU pool as ``UUID=lockpath;UUID2=lockpath2;...`` for the shim.
+
+    Consumed by the ``libktgpu.so`` LD_PRELOAD shim (``KERNELTHING_GPU_POOL``): on
+    first CUDA use a shimmed process flocks the first free lockfile and pins
+    ``CUDA_VISIBLE_DEVICES`` to its UUID. The lockfile paths are exactly those
+    ``lock_path`` creates, so shimmed agent processes and the Python scorer
+    serialize on the same inode. The UUID form is what ``CUDA_VISIBLE_DEVICES``
+    accepts unambiguously regardless of device enumeration order.
+    """
+    return ";".join(f"{gpu_uuid(i)}={lock_path(i)}" for i in indices)
+
+
 @contextlib.contextmanager
 def try_gpu_lock(index: int) -> Generator[bool, None, None]:
     """Non-blocking GPU lock: yields ``True`` if the lock was acquired, ``False`` if

@@ -307,28 +307,24 @@ function checkBash(cfg, command) {
   if (/\.humanize\b/.test(c) && commandModifiesFile(c, "plan\\.md")) {
     return block(cfg, "plan-backup-protected", {}, "The plan.md backup in the loop directory cannot be modified.");
   }
-  // Shared-GPU serialization: GPU profilers must hold the per-device lock (run via
-  // the gpu-run wrapper / flock) so two agents never profile the same card at once.
-  // We can only *reliably* recognize the named GPU tools from a command string --
-  // matched as a bare or path-prefixed binary, so "ncu-report-skill" (the CPU-only
-  // report parser) is NOT caught -- and the prompt instructs gpu-run for plain
-  // benchmark binaries too. Commands already wrapped in flock/gpu-run are allowed.
-  const GPU_TOOL = /(?:^|[\s;&|(>])(?:[^\s;&|()]*\/)?(ncu|nv-nsight-cu-cli|nsys)(?:\s|$)/;
-  if (GPU_TOOL.test(c) && !/\b(flock|gpu[_-]run)\b/.test(c)) {
-    const gr = cfg.gpuRun || "gpu-run";
-    return block(cfg, "gpu-unlocked", { GPU_RUN: gr },
-      "Wrap GPU commands in the shared-GPU lock so only one agent uses the device " +
-      `at a time, e.g.  ${gr} ncu --set full ...`);
+  // GPU allocation is mediated by the libktgpu.so LD_PRELOAD shim: on first CUDA
+  // use, a shimmed process flocks a free card and pins CUDA_VISIBLE_DEVICES to it.
+  // Agents must not touch that machinery. There is no legitimate reason for an
+  // agent command to reference these names, so mentioning any of them is blocked:
+  //   - CUDA_VISIBLE_DEVICES: setting/unsetting would pick a card without a lock
+  //   - LD_PRELOAD: unsetting would evade the shim entirely
+  //   - KERNELTHING_GPU_POOL / KERNELTHING_GUARD: the shim/guard's own config
+  //   - libktgpu / oc_guard / guard_core: reading the mechanism's internals
+  if (/\b(cuda_visible_devices|ld_preload|kernelthing_gpu_pool|kernelthing_guard|libktgpu|oc_guard|guard_core)\b/.test(c)) {
+    return block(cfg, "gpu-tamper", {},
+      "GPU allocation is managed automatically. Do not set, unset, inspect, or reference " +
+      "CUDA_VISIBLE_DEVICES, LD_PRELOAD, KERNELTHING_* or the GPU-lock shim.");
   }
-  // Python commands that import torch/cuda/pycuda likely touch the GPU: require
-  // gpu-run wrapping. bash -c 'python ...' / python3 -c '...' / python script.py
-  const PY_GPU = /(?:^|[\s;&|(>])(?:[^\s;&|()]*\/)?(python[23]?)\s+(?:-c\s+['\"]|(?:[^\s;&|()]*\/)?([^\s]*(?:bench|test|score|run)[^\s]*\.py))/.test(c);
-  const HAS_GPU_IMPORT = /\b(?:import\s+torch|import\s+cuda|from\s+torch|from\s+cuda|torch\.cuda|cudaDevice|cuInit|cuCtx)\b/.test(c);
-  if (PY_GPU && HAS_GPU_IMPORT && !/\b(flock|gpu[_-]run)\b/.test(c)) {
-    const gr = cfg.gpuRun || "gpu-run";
-    return block(cfg, "gpu-unlocked", { GPU_RUN: gr },
-      "Wrap GPU commands in the shared-GPU lock so only one agent uses the device " +
-      `at a time, e.g.  ${gr} python3 -c 'import torch; ...'`);
+  // A bare environment dump would leak the same machinery (a targeted `printenv
+  // LD_PRELOAD` is already caught above; this catches `env` / `printenv` alone).
+  if (/(?:^|[\s;&|(])(printenv|env)\s*(?:$|[;&|])/.test(c)) {
+    return block(cfg, "gpu-tamper", {},
+      "Dumping the environment is blocked; the GPU allocation machinery is not yours to inspect.");
   }
   return null;
 }

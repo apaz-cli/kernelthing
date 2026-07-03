@@ -225,11 +225,10 @@ def interactive_bootstrap(target: Path, repo_root: Path, prompt: str, cfg: Confi
             model=cfg.model,
             prompt=prompt if first else None,
             continue_last=not first,
-            gpu_index=cfg.gpu_indices[0],
+            gpu_pool=cfg.gpu_indices,
             writable=True,
             sandboxed=cfg.sandbox,
             ncu=cfg.ncu,
-            gpu_lock=gpulock.lock_path(cfg.gpu_indices[0]),
         )
         first = False
         ok, note, _ = validate_problem(target, gpu_index=cfg.gpu_indices[0])
@@ -293,12 +292,11 @@ def bootstrap_problem(
             model=cfg.model,
             session=None,
             timeout=cfg.opencode_timeout,
-            gpu_index=cfg.gpu_indices[0],
+            gpu_pool=cfg.gpu_indices,
             writable=True,
             sandboxed=cfg.sandbox,
             log_path=target / "bootstrap-opencode.log",
             ncu=cfg.ncu,
-            gpu_lock=gpulock.lock_path(cfg.gpu_indices[0]),
         )
         if gates.has_setup_blocked(res.text):
             raise RuntimeError(

@@ -11,6 +11,8 @@ candidate-summary.md
 
 # Python build artifacts
 build/
+# GPU-lock shim: compiled from kernelthing/native/ktgpu.c by setup.py's build hook
+kernelthing/libktgpu.so
 
 # CUDA build artifacts
 *.o

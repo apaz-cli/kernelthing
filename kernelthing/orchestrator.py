@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import bench, evolve, gates, gpulock, opencode_client, prompts
+from . import bench, evolve, gates, opencode_client, prompts
 from .bus import LoopBus
 from .config import Config, format_duration
 from .problem import Problem
@@ -126,7 +126,7 @@ EVOLVE_DESCRIPTOR_FOOTER = """
 ## How to finish (REQUIRED)
 Self-test by running the scorer:
 
-    {{GPU_RUN}} {{SCORE_CMD}}
+    {{SCORE_CMD}}
 
 It must report `"correct": true`. **Commit as soon as
 you have ANY correct improvement** (`git add -A && git commit -m "..."`) -- your
@@ -223,7 +223,6 @@ class Orchestrator:
         files, git push). ``phase`` is one of impl/review/finalize/methodology.
         """
         from .bootstrap import protected_files
-        from .config import REPO_ROOT
 
         root = Path(project_root or self.wd).resolve()
         return {
@@ -232,7 +231,6 @@ class Orchestrator:
             "planFile": self.problem.plan,
             "currentRound": rnd,
             "phase": phase,
-            "gpuRun": str(REPO_ROOT / "kernelthing" / "gpu_run.sh"),
             "editFiles": [str(Path(f)) for f in self.problem.edit_files],
             "editDir": str(root / self.problem.rel_dir)
             if self.problem.rel_dir not in ("", ".")
@@ -257,14 +255,12 @@ class Orchestrator:
 
     def _prompt_common(self, state: State) -> dict[str, Any]:
         """Template fields shared by every operator prompt + the descriptor footer."""
-        from .config import REPO_ROOT
 
         return {
             "PLAN": state.plan_file,
             "PLAN_FILE": state.plan_file,
             "EDIT_FILES": ", ".join(self.problem.edit_files),
             "SCORE_CMD": self._score_cmd_str(),
-            "GPU_RUN": str(REPO_ROOT / "kernelthing" / "gpu_run.sh"),
             "UNIT": self.problem.unit or self.problem.metric_name,
             "KERNEL_TOOLS": self._kernel_tools_block(),
         }
@@ -280,23 +276,20 @@ class Orchestrator:
 
         parts: list[str] = []
         pyexe = sys.executable or "python3"
-        gpu_run = str(REPO_ROOT / "kernelthing" / "gpu_run.sh")
         if self.cfg.sandbox:
             parts.append(
-                "### Shared GPU — serialize every GPU command\n\n"
-                "You share one physical GPU with other agents and the scorer. "
-                "Running on it concurrently corrupts timings and can OOM, so EVERY "
-                "command that executes on the device — your compiled benchmark, "
-                f"`ncu`, `nsys` — MUST be wrapped in `{gpu_run}`, which holds a "
-                "per-device lock for the command's duration:\n\n"
-                f"```bash\n{gpu_run} ./your_bench --args\n```\n\n"
-                "When another agent holds the lock, `gpu-run` will **block silently** "
-                "until released — this is normal queuing, not a hang. Do not run "
-                "`nvidia-smi` or `ps` to debug it; the command will proceed on its "
-                "own. Use the wait time to plan or read.\n\n"
-                "CPU-only commands (building with `nvcc`, querying KernelWiki, "
-                "parsing `.ncu-rep` files) do NOT need it. Profilers are enforced; "
-                "wrap your benchmark binaries too."
+                "### Shared GPU — allocation is automatic\n\n"
+                "You share a pool of GPUs with other agents and the scorer, and "
+                "concurrent use of one card corrupts timings and can OOM. This is "
+                "handled for you: just run your benchmark, `ncu`, or `nsys` "
+                "normally — the harness transparently assigns your process a free "
+                "GPU and holds it for that process's lifetime. **Do not** set "
+                "`CUDA_VISIBLE_DEVICES` yourself; it is managed for you and "
+                "overriding it will not give you a different card.\n\n"
+                "If every GPU is busy, your process pauses at its first CUDA call "
+                "until one frees — this is normal queuing, not a hang. Do not run "
+                "`nvidia-smi` or `ps` to debug it; the command proceeds on its own. "
+                "Use the wait time to plan or read."
             )
         if self.cfg.wiki:
             parts.append(
@@ -314,7 +307,6 @@ class Orchestrator:
                     "claude/kernel-tools-ncu.md",
                     "",
                     PYTHON=pyexe,
-                    GPU_RUN=gpu_run,
                     NCU_DIR=str(REPO_ROOT / "vendor" / "ncu-report-skill"),
                     NCU_BIN=shutil.which("ncu") or "/usr/local/cuda/bin/ncu",
                     NCU_PYTHONPATH=str(ncu_pp[-1]) if ncu_pp else "",
@@ -383,23 +375,20 @@ class Orchestrator:
         prompt: str,
         log_path: Path,
         *,
-        gpu_index: int | None = None,
         guard: dict[str, Any] | None = None,
     ) -> opencode_client.OpencodeResult:
-        gpu = gpu_index if gpu_index is not None else self._default_gpu()
         res = opencode_client.run(
             prompt,
             working_dir=self.wd,
             model=self.cfg.model,
             session=self.impl_session,
             timeout=self.cfg.opencode_timeout,
-            gpu_index=gpu,
+            gpu_pool=self._gpu_indices,
             writable=True,
             sandboxed=self.cfg.sandbox,
             log_path=log_path,
             guard=guard,
             ncu=self.cfg.ncu,
-            gpu_lock=gpulock.lock_path(gpu),
         )
         if res.session_id:
             self.impl_session = res.session_id
@@ -465,8 +454,9 @@ class Orchestrator:
             )
             if cheats:
                 return False, None, "kernelguard: " + ", ".join(x["file"] for x in cheats)
-        with gpulock.gpu_lock(gpu_index):
-            return self._score_worktree(wt, gpu_index=gpu_index)
+        # GPU access is serialized by the libktgpu.so shim inside pygpubench's
+        # isolated worker (see bench._gpu_env) -- no in-process flock needed.
+        return self._score_worktree(wt, gpu_index=gpu_index)
 
     # --- async evolutionary search ---
     @staticmethod
@@ -507,9 +497,9 @@ class Orchestrator:
 
         Pure git plumbing is taken under ``self._git_lock``; the agent turn and the
         benchmark run outside it. GPU exclusivity is handled by the per-device
-        flock (kernelthing/gpulock.py): the agent holds it for its own GPU work via
-        the ``gpu-run`` wrapper, and ``_guarded_score`` holds it for the bench.
-        Returns the scored Member; never raises.
+        flock (kernelthing/gpulock.py): the agent's processes claim a card via the
+        ``libktgpu.so`` LD_PRELOAD shim, and ``_guarded_score`` holds it for the
+        bench. Returns the scored Member; never raises.
         """
         m = evolve.Member(id=task.member_id, operator=task.operator, parent_id=task.parent_id)
         parent_commit = task.parent_commit or base
@@ -536,7 +526,7 @@ class Orchestrator:
                 model=self.cfg.model,
                 session=None,
                 timeout=self.cfg.opencode_timeout,
-                gpu_index=gpu_index,
+                gpu_pool=self._gpu_indices,
                 writable=True,
                 sandboxed=self.cfg.sandbox,
                 log_path=log,
@@ -544,7 +534,6 @@ class Orchestrator:
                 extra_writable=[self.wd / ".git"],
                 guard=guard,
                 ncu=self.cfg.ncu,
-                gpu_lock=gpulock.lock_path(gpu_index),
             )
             head = gates.git(["rev-parse", "HEAD"], wt).stdout.strip()
             m.commit = head if head and head != parent_commit else None
@@ -582,33 +571,32 @@ class Orchestrator:
         with self._git_lock:
             gates.git(["worktree", "add", "--detach", "--force", str(wt), base], self.wd)
         try:
-            with gpulock.gpu_lock(seed_gpu):
-                if self.cfg.pygpubench:
-                    bl, berr = bench.measure_baseline(self.problem, wt, gpu_index=seed_gpu)
-                    if berr:
-                        self._log(
-                            f"baseline pin failed on GPU {seed_gpu} ({berr}); "
-                            "falling back to per-candidate baseline"
-                        )
-                    elif bl is not None:
-                        self._baselines[seed_gpu] = bl
-                        self._log(
-                            f"GPU {seed_gpu} baseline pinned: {bl:.1f}us "
-                            "(= 100%, fixed for the run)"
-                        )
-                m.correct, m.metric, m.error = self._score_worktree(wt, gpu_index=seed_gpu)
+            # GPU access is serialized by the libktgpu.so shim inside pygpubench's
+            # isolated worker (see bench._gpu_env) -- no in-process flock needed.
+            if self.cfg.pygpubench:
+                bl, berr = bench.measure_baseline(self.problem, wt, gpu_index=seed_gpu)
+                if berr:
+                    self._log(
+                        f"baseline pin failed on GPU {seed_gpu} ({berr}); "
+                        "falling back to per-candidate baseline"
+                    )
+                elif bl is not None:
+                    self._baselines[seed_gpu] = bl
+                    self._log(
+                        f"GPU {seed_gpu} baseline pinned: {bl:.1f}us (= 100%, fixed for the run)"
+                    )
+            m.correct, m.metric, m.error = self._score_worktree(wt, gpu_index=seed_gpu)
             # Measure baselines on the remaining GPUs in the pool.
             for gpu in self._gpu_indices:
                 if gpu == seed_gpu:
                     continue
-                with gpulock.gpu_lock(gpu):
-                    if self.cfg.pygpubench:
-                        bl, berr = bench.measure_baseline(self.problem, wt, gpu_index=gpu)
-                        if berr:
-                            self._log(f"GPU {gpu} baseline pin failed ({berr})")
-                        elif bl is not None:
-                            self._baselines[gpu] = bl
-                            self._log(f"GPU {gpu} baseline pinned: {bl:.1f}us")
+                if self.cfg.pygpubench:
+                    bl, berr = bench.measure_baseline(self.problem, wt, gpu_index=gpu)
+                    if berr:
+                        self._log(f"GPU {gpu} baseline pin failed ({berr})")
+                    elif bl is not None:
+                        self._baselines[gpu] = bl
+                        self._log(f"GPU {gpu} baseline pinned: {bl:.1f}us")
         finally:
             with self._git_lock:
                 gates.git(["worktree", "remove", "--force", str(wt)], self.wd)

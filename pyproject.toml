@@ -37,9 +37,14 @@ kernelthing = "kernelthing.cli:main"
 include = ["kernelthing*"]
 
 # The opencode PreToolUse guard plugin ships inside the package (loaded by
-# opencode as an external plugin; see kernelthing/opencode_client.py).
+# opencode as an external plugin; see kernelthing/opencode_client.py). The
+# GPU-lock shim (libktgpu.so) is compiled from native/ktgpu.c by setup.py's
+# build hook; both the source and the built object ship with the package.
 [tool.setuptools.package-data]
-kernelthing = ["oc_guard/*.js", "oc_guard/*.json", "webui/*.html", "webui/*.js"]
+kernelthing = [
+  "oc_guard/*.js", "oc_guard/*.json", "webui/*.html", "webui/*.js",
+  "native/*.c", "libktgpu.so",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

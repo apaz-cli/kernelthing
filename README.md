@@ -103,19 +103,25 @@ and exploration targets empty niches so the search can't collapse onto one linea
 **The measured benchmark is the only thing that decides what is elite or gets promoted.** The run stops on a global budget (wall-clock / candidate count), not a
 round count. `-j` sets max concurrent agents; all GPU work stays serialized.
 
-**One GPU at a time.** A per-device `flock` (`kernelthing/gpulock.py`) keyed on the
-physical GPU **UUID** (not the CUDA index, which is relative to each process's
-`CUDA_VISIBLE_DEVICES`) gates every GPU command — the authoritative benchmark and
-each agent's own runs/`ncu` profiles, which go through a `gpu-run` wrapper bound
-into the sandbox. So nothing ever contends on the device, even across separate
-kernelthing processes targeting the same card. Multi-GPU is one process per device
-(`--gpu N` / `CUDA_VISIBLE_DEVICES=N`); each acquires only its own card's lock.
+**Automatic GPU allocation.** Access to the GPU pool is mediated by a per-device
+`flock` (`kernelthing/gpulock.py`) keyed on the physical GPU **UUID** (not the CUDA
+index, which is relative to each process's `CUDA_VISIBLE_DEVICES`). The authoritative
+benchmark takes the lock in-process; agent processes take it transparently through an
+`LD_PRELOAD` shim (`kernelthing/native/ktgpu.c` → `libktgpu.so`): on the first CUDA
+call, the shim flocks a free card from the pool, pins `CUDA_VISIBLE_DEVICES` to it for
+that process's lifetime, and blocks only if every card is busy. Purely CPU commands
+never trigger it, so builds and analysis don't hold a GPU. There is no wrapper for the
+agent to remember and nothing to opt into — and the guard blocks any attempt to set
+`CUDA_VISIBLE_DEVICES`/`LD_PRELOAD` or otherwise touch the mechanism, so an agent can't
+grab an unlocked card. Nothing ever contends on a device, even across separate
+kernelthing processes. `--gpu N` (repeatable) sets the pool.
 
 ## Sandboxing
 
 Every edit-capable agent runs under **bubblewrap**: filesystem read-only except the
-candidate's worktree, opencode's own state, and `/tmp`; GPU device nodes bound through;
-GPU pinned via `CUDA_VISIBLE_DEVICES`. Network stays up (the model API needs it);
+candidate's worktree, opencode's own state, and `/tmp`; GPU device nodes and the pool's
+lock files bound through; `CUDA_VISIBLE_DEVICES` empty by default (fail-closed) so a
+card is reachable only via the lock shim. Network stays up (the model API needs it);
 the filesystem is the confinement boundary. opencode's `--dangerously-skip-permissions`
 is only safe because of this.
 

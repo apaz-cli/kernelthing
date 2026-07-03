@@ -19,11 +19,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import sandbox
+from . import gpulock, sandbox
 
 # The PreToolUse guard plugin and the block-message templates it renders.
 GUARD_PLUGIN = Path(__file__).resolve().parent / "oc_guard" / "guard.js"
 GUARD_BLOCK_DIR = Path(__file__).resolve().parent.parent / "prompts" / "block"
+
+# GPU-lock LD_PRELOAD shim (compiled from native/ktgpu.c by setup.py's build hook).
+# Injected into every agent-spawned process so the first CUDA call claims a free
+# card from the pool; see native/ktgpu.c and gpulock.gpu_pool_spec.
+GPU_SHIM = Path(__file__).resolve().parent / "libktgpu.so"
 
 
 def opencode_state_dirs() -> list[Path]:
@@ -83,17 +88,27 @@ def parse_ndjson(stdout: str) -> tuple[str, str | None, float, dict[str, Any], i
 
 def build_opencode_env(
     *,
-    gpu_index: int,
-    gpu_lock: Path | None = None,
+    gpu_pool: list[int],
     data_dir: Path | None = None,
     guard: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[Path]]:
-    """Build the env dict and opencode state dirs shared by run/run_interactive."""
+    """Build the env dict and opencode state dirs shared by run/run_interactive.
+
+    GPU access is mediated by the ``libktgpu.so`` LD_PRELOAD shim: we set
+    ``KERNELTHING_GPU_POOL`` to the whole pool and inject the shim so the first
+    CUDA call in any agent-spawned process flocks a free card and pins
+    ``CUDA_VISIBLE_DEVICES`` to it. ``CUDA_VISIBLE_DEVICES=""`` stays as a
+    fail-closed backstop: a process that somehow evades the shim sees no GPU
+    rather than an unlocked one.
+    """
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = ""
-    env["KERNELTHING_GPU_INDEX"] = str(gpu_index)
-    if gpu_lock is not None:
-        env["KERNELTHING_GPU_LOCK"] = str(gpu_lock)
+    pool_spec = gpulock.gpu_pool_spec(gpu_pool)
+    if pool_spec:
+        env["KERNELTHING_GPU_POOL"] = pool_spec
+    if GPU_SHIM.exists():
+        prev = env.get("LD_PRELOAD", "")
+        env["LD_PRELOAD"] = f"{GPU_SHIM}:{prev}" if prev else str(GPU_SHIM)
 
     oc_config: dict[str, Any] = {"snapshot": False}
     if guard is not None:
@@ -122,13 +137,12 @@ def run_interactive(
     session: str | None = None,
     continue_last: bool = False,
     prompt: str | None = None,
-    gpu_index: int = 0,
+    gpu_pool: list[int] | tuple[int, ...] = (),
     writable: bool = True,
     sandboxed: bool = True,
     data_dir: Path | None = None,
     extra_writable: list[Path] | tuple[Path, ...] = (),
     ncu: bool = True,
-    gpu_lock: Path | None = None,
 ) -> int:
     """Launch opencode's interactive TUI attached to the terminal, return exit code.
 
@@ -152,7 +166,7 @@ def run_interactive(
     if prompt:
         inner += ["--prompt", prompt]
 
-    env, oc_state = build_opencode_env(gpu_index=gpu_index, gpu_lock=gpu_lock, data_dir=data_dir)
+    env, oc_state = build_opencode_env(gpu_pool=list(gpu_pool), data_dir=data_dir)
 
     argv = sandbox.wrap(
         inner,
@@ -161,7 +175,7 @@ def run_interactive(
         writable_extra=[*oc_state, *extra_writable],
         enabled=sandboxed and sandbox.available(),
         ncu=ncu,
-        gpu_lock=gpu_lock,
+        gpu_indices=list(gpu_pool),
     )
     return subprocess.run(argv, env=env).returncode
 
@@ -173,7 +187,7 @@ def run(
     model: str,
     session: str | None = None,
     timeout: int = 5400,
-    gpu_index: int = 0,
+    gpu_pool: list[int] | tuple[int, ...] = (),
     writable: bool = True,
     sandboxed: bool = True,
     log_path: Path | None = None,
@@ -181,7 +195,6 @@ def run(
     extra_writable: list[Path] | tuple[Path, ...] = (),
     guard: dict[str, Any] | None = None,
     ncu: bool = True,
-    gpu_lock: Path | None = None,
 ) -> OpencodeResult:
     """Run one opencode turn and return the parsed result.
 
@@ -229,7 +242,7 @@ def run(
     # reach the agent -- it runs in the per-worktree problem repo and we override
     # config via OPENCODE_CONFIG_CONTENT here -- so set it inline.
     env, oc_state = build_opencode_env(
-        gpu_index=gpu_index, gpu_lock=gpu_lock, data_dir=data_dir, guard=guard
+        gpu_pool=list(gpu_pool), data_dir=data_dir, guard=guard
     )
 
     argv = sandbox.wrap(
@@ -239,7 +252,7 @@ def run(
         writable_extra=[*oc_state, *extra_writable],
         enabled=sandboxed and sandbox.available(),
         ncu=ncu,
-        gpu_lock=gpu_lock,
+        gpu_indices=list(gpu_pool),
     )
 
     import tempfile

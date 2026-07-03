@@ -47,12 +47,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import gpulock
 from .problem import Problem
 
-# Protects the process-global CUDA_VISIBLE_DEVICES env var while a pygpubench
-# subprocess inherits it; the actual GPU work is already serialized per-device by
-# the per-GPU flock (gpulock.py), so this lock is held only for microseconds.
+# Protects the process-global env vars (CUDA_VISIBLE_DEVICES / LD_PRELOAD /
+# KERNELTHING_GPU_POOL) while a pygpubench subprocess inherits them.
 _env_lock = threading.Lock()
+
+# libktgpu.so LD_PRELOAD shim, compiled next to this package by setup.py's build
+# hook. Handed to pygpubench's isolated worker so it flocks a GPU on first use.
+_GPU_SHIM = Path(__file__).resolve().parent / "libktgpu.so"
 
 JSON_OBJ = re.compile(r"\{.*\}")
 
@@ -306,21 +310,42 @@ def median_us(pygpubench: Any, result: Any) -> float | None:
 
 @contextlib.contextmanager
 def _gpu_env(gpu_index: int) -> Generator[None, None, None]:
-    """Temporarily set ``CUDA_VISIBLE_DEVICES`` for a pygpubench subprocess to inherit.
+    """Arrange serialized GPU access for pygpubench's isolated subprocess.
 
-    The per-GPU flock serialises actual device work; this lock only serialises the
-    env-var mutation (microseconds), so two GPUs can bench concurrently.
+    The kernel never runs in this process -- ``pygpubench.do_bench_isolated``
+    forks a sandboxed worker to run it. We hand that worker the ``libktgpu.so``
+    LD_PRELOAD shim: on its first CUDA call it flocks a card from the pool and
+    holds it for the worker's (short) lifetime, releasing on exit. This is the
+    same per-UUID flock agents take through the shim, so orchestrator scoring and
+    agent commands serialize on one inode -- with no in-process lock to deadlock
+    against (a lock held here would collide with the shim's flock on the same
+    file).
+
+    The pool is pinned to just ``gpu_index`` unless an outer shim already set one
+    (an agent running ``kernelthing score`` -- let its full-pool shim choose).
+    ``CUDA_VISIBLE_DEVICES`` is blanked (fail-closed); the shim pins the locked
+    card's UUID. If the shim isn't built, fall back to pinning the index.
     """
-    old = os.environ.get("CUDA_VISIBLE_DEVICES")
+    keys = ("CUDA_VISIBLE_DEVICES", "LD_PRELOAD", "KERNELTHING_GPU_POOL")
+    saved = {k: os.environ.get(k) for k in keys}
     with _env_lock:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+        if _GPU_SHIM.exists():
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            if not os.environ.get("KERNELTHING_GPU_POOL"):
+                os.environ["KERNELTHING_GPU_POOL"] = gpulock.gpu_pool_spec([gpu_index])
+            prev = saved["LD_PRELOAD"] or ""
+            if str(_GPU_SHIM) not in prev.split(":"):
+                os.environ["LD_PRELOAD"] = f"{_GPU_SHIM}:{prev}" if prev else str(_GPU_SHIM)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
         try:
             yield
         finally:
-            if old is None:
-                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-            else:
-                os.environ["CUDA_VISIBLE_DEVICES"] = old
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 def derive_metric(
@@ -390,7 +415,7 @@ def measure_baseline(
         with _gpu_env(gpu_index):
             return _measure_baseline_impl(problem, worktree, gpu_index)
     except Exception as e:
-        return None, _explain_bench_error(e)
+        return None, explain_bench_error(e)
 
 
 def _measure_baseline_impl(
@@ -483,7 +508,7 @@ def score(
         with _gpu_env(gpu_index):
             return _score_impl(problem, worktree, baseline_median, gpu_index)
     except Exception as e:
-        return False, None, _explain_bench_error(e)
+        return False, None, explain_bench_error(e)
 
 
 def _score_impl(
