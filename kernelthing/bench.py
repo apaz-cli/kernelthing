@@ -385,18 +385,18 @@ def derive_metric(
 def measure_baseline(
     problem: Problem, worktree: Path, *, gpu_index: int = 0
 ) -> tuple[float | None, str | None]:
-    """Benchmark the baseline reference kernel once, returning ``(median_us, err)``.
+    """Benchmark the baseline reference kernel once, returning ``(median_us, err)``."""
+    try:
+        with _gpu_env(gpu_index):
+            return _measure_baseline_impl(problem, worktree, gpu_index)
+    except Exception as e:
+        return None, _explain_bench_error(e)
 
-    The baseline (e.g. ``torch.matmul``) is the fixed denominator for
-    ``pct_baseline`` / ``speedup`` metrics. The orchestrator calls this once at
-    run start and pins the result into every ``score(..., baseline_median=...)``
-    call, so the baseline is definitionally 100% and candidate percentages share
-    one denominator instead of drifting with per-scoring GPU noise.
 
-    Returns ``(None, None)`` when the problem declares no baseline qualname
-    (nothing to pin); ``(None, err)`` on failure, so the caller can fall back to
-    per-candidate baseline measurement.
-    """
+def _measure_baseline_impl(
+    problem: Problem, worktree: Path, gpu_index: int
+) -> tuple[float | None, str | None]:
+    """Body of ``measure_baseline`` — runs inside ``_gpu_env``."""
     try:
         import pygpubench
     except Exception as e:
@@ -415,17 +415,16 @@ def measure_baseline(
             gen = _GeneratorAdapter(getattr(task_mod, s.generator))
             base_shim_q, base_shim_path = _shim_qualname(base_q, s.prob_dir)
             try:
-                with _gpu_env(gpu_index):
-                    res = do_bench(
-                        pygpubench,
-                        base_shim_q,
-                        gen,
-                        s.test_args,
-                        s.repeats,
-                        s.seed,
-                        s.bench_cfg,
-                        writable_paths=[str(s.prob_dir)],
-                    )
+                res = do_bench(
+                    pygpubench,
+                    base_shim_q,
+                    gen,
+                    s.test_args,
+                    s.repeats,
+                    s.seed,
+                    s.bench_cfg,
+                    writable_paths=[str(s.prob_dir)],
+                )
                 median = median_us(pygpubench, res)
                 if median is None:
                     return None, f"baseline '{base_q}' failed: errors={res.errors}"
@@ -481,6 +480,17 @@ def score(
     ``gpu_index``: set ``CUDA_VISIBLE_DEVICES`` for the pygpubench subprocess.
     """
     try:
+        with _gpu_env(gpu_index):
+            return _score_impl(problem, worktree, baseline_median, gpu_index)
+    except Exception as e:
+        return False, None, _explain_bench_error(e)
+
+
+def _score_impl(
+    problem: Problem, worktree: Path, baseline_median: float | None, gpu_index: int
+) -> tuple[bool, float | None, str | None]:
+    """Body of ``score`` — runs inside ``_gpu_env`` so torch sees the GPU at import time."""
+    try:
         import pygpubench
     except Exception as e:
         return (
@@ -510,34 +520,32 @@ def score(
 
             try:
                 writable = [str(s.prob_dir)]
-                with _gpu_env(gpu_index):
-                    cand_res = do_bench(
-                        pygpubench,
-                        sub_shim_q,
-                        gen,
-                        s.test_args,
-                        s.repeats,
-                        s.seed,
-                        s.bench_cfg,
-                        writable_paths=writable,
-                    )
+                cand_res = do_bench(
+                    pygpubench,
+                    sub_shim_q,
+                    gen,
+                    s.test_args,
+                    s.repeats,
+                    s.seed,
+                    s.bench_cfg,
+                    writable_paths=writable,
+                )
                 cand_median = median_us(pygpubench, cand_res)
                 if cand_median is None:
                     return False, None, f"submission failed correctness: errors={cand_res.errors}"
-                with _gpu_env(gpu_index):
-                    metric, err = derive_metric(
-                        pygpubench,
-                        problem,
-                        gen,
-                        s.test_args,
-                        s.repeats,
-                        s.seed,
-                        s.bench_cfg,
-                        cand_median,
-                        baseline_shim_q=base_shim_q,
-                        pinned_baseline=baseline_median,
-                        writable_paths=writable,
-                    )
+                metric, err = derive_metric(
+                    pygpubench,
+                    problem,
+                    gen,
+                    s.test_args,
+                    s.repeats,
+                    s.seed,
+                    s.bench_cfg,
+                    cand_median,
+                    baseline_shim_q=base_shim_q,
+                    pinned_baseline=baseline_median,
+                    writable_paths=writable,
+                )
                 if err:
                     return True, None, err
                 return True, metric, None

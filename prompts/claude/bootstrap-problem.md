@@ -130,6 +130,15 @@ kernel source it calls — the one `edit_file` — can be in any language:
   loads it (e.g. `torch.utils.cpp_extension.load`, or `nvcc` + `ctypes`/`cffi`) and
   calls it.
 
+When using `load_inline` with a `.cu` kernel: put only a forward declaration of your
+entry function in `cpp_sources` (no `#include <torch/extension.h>`, no `PYBIND11_MODULE`),
+put the full definition plus the kernel in `cuda_sources`, and list the function name in
+`functions`. Anything beyond that collides with what `load_inline` auto-generates.
+
+Build artifacts (nvcc temp files, load_inline output) must land inside the problem
+directory. The benchmark sandbox blocks writes everywhere else. Set build_directory
+to a path under the problem dir and point TMPDIR/TMP/TEMP there before calling load_inline.
+
 Keep `edit_files` **as minimal as possible** — ideally just that single kernel
 source. Every extra editable file widens the cheat surface and dilutes the
 optimizer's focus. `submission.py`, `task.py`, `baseline.py`, and the reference
@@ -163,11 +172,12 @@ self-test harness to drift out of sync. You do not need to author a test file. I
 you need to debug a failure, run `kernelthing score .` and read its `error` field.
 
 ## Finishing
+- Do not finish unless `kernelthing score .` printed `"correct": true`. This is
+  very important.
 - If you fully authored a valid, self-tested problem, end your message with a
-  short "where things are" summary (the manifest's name, the input shapes, the
-  tolerances, the submission binding, the metric) and then the single word
-  `{{COMPLETE}}` on its own line. Do not emit `{{COMPLETE}}` unless
-  `kernelthing score .` printed `"correct": true`.
+  short "where things are" summary (the problem directory path, the manifest's
+  name, the input shapes, the tolerances, the submission binding, the metric)
+  and then the single word `{{COMPLETE}}` on its own line.
 - Only when an objective **was** provided but is genuinely impossible to realize
   (truly unknowable reference/shapes that you cannot defensibly resolve), explain
   precisely what is missing and end with the single word `{{SETUP_BLOCKED}}` on its

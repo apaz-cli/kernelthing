@@ -72,7 +72,7 @@ def protected_files(problem: Problem) -> set[str]:
     return {f"{m}.py" for m in mods if m}
 
 
-def validate_problem(target: Path) -> tuple[bool, str | None, Problem | None]:
+def validate_problem(target: Path, *, gpu_index: int = 0) -> tuple[bool, str | None, Problem | None]:
     """Runtime validation: a loadable manifest whose shipped submission scores correct.
 
     Fails open when pygpubench/torch are not installed (ok=True with a note) -- the
@@ -105,7 +105,8 @@ def validate_problem(target: Path) -> tuple[bool, str | None, Problem | None]:
         )
     if not bench.available():
         return True, "pygpubench not installed -- skipping runtime validation", problem
-    correct, _metric, err = bench.score(problem, problem.repo_root)
+    with gpulock.gpu_lock(gpu_index):
+        correct, _metric, err = bench.score(problem, problem.repo_root, gpu_index=gpu_index)
     if not correct:
         return False, err or "shipped submission did not score correct", problem
     return True, None, problem
@@ -231,7 +232,7 @@ def interactive_bootstrap(target: Path, repo_root: Path, prompt: str, cfg: Confi
             gpu_lock=gpulock.lock_path(cfg.gpu_indices[0]),
         )
         first = False
-        ok, note, _ = validate_problem(target)
+        ok, note, _ = validate_problem(target, gpu_index=cfg.gpu_indices[0])
         print_summary(target, ok, note)
         question = (
             "(a)pprove, (e)dit more, or (q)uit? [a/e/q] "
@@ -304,7 +305,7 @@ def bootstrap_problem(
                 "bootstrap: --auto-setup agent emitted SETUP_BLOCKED -- cannot "
                 "author the problem from the given objective:\n" + res.text.strip()[-2000:]
             )
-        ok, note, _ = validate_problem(target)
+        ok, note, _ = validate_problem(target, gpu_index=cfg.gpu_indices[0])
         if not ok:
             raise RuntimeError(f"bootstrap: --auto-setup validation failed: {note}")
         print("[bootstrap] problem validated; --auto-setup accepting", file=sys.stderr)
@@ -312,6 +313,11 @@ def bootstrap_problem(
         # Drop the operator straight into the opencode TUI, seeded with the bootstrap
         # prompt, to describe the objective and author the files conversationally.
         interactive_bootstrap(target, repo_root, prompt, cfg)
+
+    # Lock this problem to the GPU model it was authored on.
+    from .problem import set_gpu_model
+    set_gpu_model(target, gpulock.gpu_name(cfg.gpu_indices[0]))
+    print(f"[bootstrap] locked problem to GPU: {gpulock.gpu_name(cfg.gpu_indices[0])}", file=sys.stderr)
 
     commit_problem(target, repo_root)
     return target

@@ -39,7 +39,7 @@ include = ["kernelthing*"]
 # The opencode PreToolUse guard plugin ships inside the package (loaded by
 # opencode as an external plugin; see kernelthing/opencode_client.py).
 [tool.setuptools.package-data]
-kernelthing = ["oc_guard/*.js", "oc_guard/*.json"]
+kernelthing = ["oc_guard/*.js", "oc_guard/*.json", "webui/*.html", "webui/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -54,9 +54,7 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "T20", "Q", "RUF", "SIM", "C4"]
 ignore = ["T201", "E501"]
 
 [tool.ruff.lint.per-file-ignores]
-# The inline web UI is a single minified HTML/CSS/JS string; length rules don't apply.
-"kernelthing/webui.py" = ["E501", "SIM102", "RUF001"]
-
+"kernelthing/webui/__init__.py" = ["SIM102"]
 [tool.ruff.lint.isort]
 known-first-party = ["kernelthing"]
 

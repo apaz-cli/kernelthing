@@ -23,6 +23,31 @@ from .config import Config
 from .orchestrator import Orchestrator
 from .problem import Problem, load_problem, prepare_problem
 
+
+def _check_gpu_model(problem: Problem, gpus: list[int]) -> str | None:
+    """Return an error message if any GPU doesn't match the problem's required model.
+
+    When ``problem.gpu`` is empty (pre-existing or hand-authored problems) this is
+    a no-op — no restriction.
+    """
+    if not problem.gpu:
+        return None
+    from . import gpulock
+
+    bad: list[str] = []
+    for idx in gpus:
+        name = gpulock.gpu_name(idx)
+        if name != problem.gpu:
+            bad.append(f"  GPU {idx}: {name}")
+    if not bad:
+        return None
+    return (
+        f"\nProblem '{problem.name}' requires GPU model: {problem.gpu}\n"
+        "but the following GPU(s) don't match:\n" + "\n".join(bad) + "\n\n"
+        "Use --gpu to pick matching GPUs, or remove the 'gpu' field from\n"
+        "the problem's problem.json if this restriction is wrong.\n"
+    )
+
 BANNER_ART = r"""
  __                                          ___     __      __
 /\ \                                        /\_ \   /\ \__  /\ \        __
@@ -149,18 +174,25 @@ def run_loop(args: argparse.Namespace) -> int:
 
     from . import gpulock
 
-    arch_warning = gpulock.check_architecture_mismatch(gpus)
-    if arch_warning:
-        print(arch_warning, file=sys.stderr)
-        ans = input("[kernelthing] Proceed anyway? [y/N] ").strip().lower()
-        if ans not in ("y", "yes"):
-            return 1
+    if not args.override_gpu:
+        arch_warning = gpulock.check_architecture_mismatch(gpus)
+        if arch_warning:
+            print(arch_warning, file=sys.stderr)
+            ans = input("[kernelthing] Proceed anyway? [y/N] ").strip().lower()
+            if ans not in ("y", "yes"):
+                return 1
 
     try:
         problem = resolve_problem(args, cfg)
     except (FileNotFoundError, RuntimeError, KeyError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+
+    if not args.override_gpu:
+        gpu_err = _check_gpu_model(problem, gpus)
+        if gpu_err:
+            print(gpu_err, file=sys.stderr)
+            return 2
 
     bus = None
     if not args.no_web:
@@ -205,11 +237,16 @@ def score_command(argv: list[str]) -> int:
     """``kernelthing score [<dir>]``: run the authoritative scorer on a problem dir
     and print its JSON verdict.
 
-    This is the *same* ``bench.score`` call that gates bootstrap (``_validate``) and
+    This is the *same* ``bench.score`` call that gates bootstrap (``validate_problem``) and
     every loop round -- so a green here means the problem (or a kernel edit) scores
     correct for real, with no bespoke self-test harness to drift out of sync.
+
+    ``--gpu N`` (repeatable) picks the GPU; without it, any free GPU of the same
+    model as the default device (``CUDA_VISIBLE_DEVICES``/GPU 0) is used, falling
+    back to a blocking lock on GPU 0 if all are busy.
     """
     from . import bench
+    from . import gpulock
 
     p = argparse.ArgumentParser(
         prog="kernelthing score",
@@ -223,6 +260,19 @@ def score_command(argv: list[str]) -> int:
         default=".",
         help="problem dir containing problem.json (default: current dir)",
     )
+    p.add_argument(
+        "--gpu",
+        type=int,
+        action="append",
+        help="CUDA device index to score on (may be repeated). Without it the "
+        "scorer picks any free GPU of the same model as the default device.",
+    )
+    p.add_argument(
+        "--override-gpu",
+        action="store_true",
+        help=argparse.SUPPRESS,
+        default=False,
+    )
     args = p.parse_args(argv)
 
     try:
@@ -230,8 +280,28 @@ def score_command(argv: list[str]) -> int:
     except (FileNotFoundError, RuntimeError, KeyError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    correct, metric, err = bench.score(problem, problem.repo_root)
-    print(json.dumps({"correct": correct, "metric": metric, "unit": problem.unit, "error": err}))
+
+    if not args.override_gpu and args.gpu:
+        gpu_err = _check_gpu_model(problem, args.gpu)
+        if gpu_err:
+            print(gpu_err, file=sys.stderr)
+            return 2
+
+    if args.gpu:
+        gpu = gpulock.pick_free_gpu(preferred=args.gpu)
+    else:
+        if problem.gpu:
+            gpu = gpulock.pick_free_gpu(model=problem.gpu)
+        else:
+            default_index = default_gpu()[0]
+            gpu = gpulock.pick_free_gpu(
+                model=gpulock.gpu_name(default_index),
+                arch=gpulock.gpu_architecture(default_index),
+            )
+    with gpulock.gpu_lock(gpu):
+        correct, metric, err = bench.score(problem, problem.repo_root, gpu_index=gpu)
+    result = {"correct": correct, "metric": metric, "unit": problem.unit, "error": err}
+    print(json.dumps(result))
     return 0 if correct else 1
 
 
@@ -373,6 +443,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="at loop exit, run a retrospective that writes a sanitized "
         "methodology report (methodology-analysis-report.md) to the loop dir",
+    )
+    runtime.add_argument(
+        "--override-gpu",
+        action="store_true",
+        help=argparse.SUPPRESS,
+        default=False,
     )
 
     args = parser.parse_args(argv)

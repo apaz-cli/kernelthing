@@ -162,6 +162,98 @@ def check_architecture_mismatch(indices: list[int]) -> str | None:
     return "\n".join(lines)
 
 
+def discover_gpus() -> list[dict[str, object]]:
+    """Return every visible GPU as ``[{index, name, arch}, ...]``.
+
+    If ``nvidia-smi`` is unavailable or errors, returns an empty list.
+    """
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        return []
+    with contextlib.suppress(Exception):
+        out = subprocess.run(
+            [smi, "--query-gpu=index,name,compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            result: list[dict[str, object]] = []
+            for line in out.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",", 2)]
+                if len(parts) < 2:
+                    continue
+                idx = int(parts[0].strip())
+                name = parts[1].strip() if len(parts) > 1 else f"GPU {idx}"
+                cc = parts[2].strip() if len(parts) > 2 else "0.0"
+                major, minor = cc.split(".") if "." in cc else (cc, "0")
+                arch = f"sm_{major}{minor}"
+                result.append({"index": idx, "name": name, "arch": arch})
+            return result
+    return []
+
+
+@contextlib.contextmanager
+def try_gpu_lock(index: int) -> Generator[bool, None, None]:
+    """Non-blocking GPU lock: yields ``True`` if the lock was acquired, ``False`` if
+    another process already holds it (the caller should try a different GPU or wait).
+
+    Always releases the fd on exit, whether the lock was acquired or not.
+    """
+    path = lock_path(index)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o666)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except (BlockingIOError, OSError):
+            acquired = False
+        yield acquired
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def pick_free_gpu(preferred: list[int] | None = None,
+                  *, model: str | None = None,
+                  arch: str | None = None) -> int:
+    """Return a GPU index that is (a) in *preferred* or matches *model*/*arch*, and
+    (b) whose lock is immediately acquirable. Falls back to blocking on the first
+    candidate if none is free.
+
+    When *preferred* is given, it is tried first (in order). When it is ``None``,
+    all GPUs matching *model* and/or *arch* are considered (if both are ``None``,
+    every visible GPU is a candidate). Returns the first free GPU index, or blocks
+    on the first candidate if every one is busy.
+
+    Useful for ``kernelthing score``: auto-select any GPU of the same model as the
+    default device so the scorer never idles while a free matching GPU sits unused.
+    """
+    candidates: list[int] = []
+    if preferred:
+        candidates = list(preferred)
+    else:
+        for g in discover_gpus():
+            if model is not None and g["name"] != model:
+                continue
+            if arch is not None and g["arch"] != arch:
+                continue
+            candidates.append(int(g["index"]))
+        if not candidates:
+            # No matching GPU found — try all visible GPUs.
+            for g in discover_gpus():
+                candidates.append(int(g["index"]))
+        if not candidates:
+            return 0
+
+    for gpu in candidates:
+        with try_gpu_lock(gpu) as acquired:
+            if acquired:
+                return gpu
+    # All busy — block on the first candidate.
+    return candidates[0]
+
+
 @contextlib.contextmanager
 def gpu_lock(index: int) -> Generator[Path, None, None]:
     """Hold an exclusive flock on GPU *index* for the duration of the block.

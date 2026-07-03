@@ -37,6 +37,12 @@ class Problem:
     unit: str = ""
     direction: str = "maximize"  # or "minimize"
     bench_runs: int = 3
+    # Expected GPU model name (matched against nvidia-smi --query-gpu=name).
+    # Empty means "no restriction" — pre-existing or hand-authored problems
+    # are allowed to run on any GPU. The bootstrap process fills this in
+    # automatically from the GPU it runs on, and kernelthing rejects --gpu
+    # indices whose model name doesn't match.
+    gpu: str = ""
     # pygpubench config: submission_qualname, task_module, generator,
     # test_args, repeats, seed, timeout, landlock/mseal/allow_root. See bench.py.
     bench: dict[str, Any] = field(default_factory=dict)
@@ -83,6 +89,7 @@ def load_problem(path: str | Path) -> Problem:
         unit=data.get("unit", ""),
         direction=data.get("direction", "maximize"),
         bench_runs=int(data.get("bench_runs", 3)),
+        gpu=data.get("gpu", ""),
         bench=dict(data.get("bench", {})),
         metric=dict(data.get("metric", {})),
     )
@@ -116,6 +123,23 @@ def prepare_problem(problem: Problem, managed_root: Path) -> Problem:
     )
 
     return load_problem(dest / "problem.json")
+
+
+def set_gpu_model(problem_dir: Path, model_name: str) -> None:
+    """Write *model_name* into the problem's ``problem.json`` under the ``gpu`` key.
+
+    The bootstrap process calls this after validation to lock the problem to the
+    GPU model it was authored on. The manifest is updated in-place; a subsequent
+    ``git commit`` will include it.
+    """
+    manifest = problem_dir / "problem.json"
+    if not manifest.is_file():
+        return
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    if data.get("gpu") == model_name:
+        return
+    data["gpu"] = model_name
+    manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 def rewrite_plan_for_worktree(dest: Path, problem: Problem) -> None:
