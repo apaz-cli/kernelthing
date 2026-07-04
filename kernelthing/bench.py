@@ -261,10 +261,55 @@ def _cleanup_shim(shim_path: Path) -> None:
             p.unlink()
 
 
+# Minimum completed iterations for a usable timing. pygpubench truncates the
+# repeat count for a long-running kernel and flags the run ``full=False`` (so
+# ``result.success`` is False), but the iterations that *did* complete are still
+# valid timings -- we take their median rather than discarding the score, else any
+# kernel slower than pygpubench's per-benchmark wall-time budget is permanently
+# unscoreable (baseline can't pin, every candidate reads ?%baseline). Two is the
+# floor ``basic_stats`` needs (its variance divides by ``runs - 1``).
+MIN_VALID_REPEATS = 2
+
+
 def median_us(pygpubench: Any, result: Any) -> float | None:
-    if not result.success:
+    """Median of the completed timed iterations, or ``None`` if unusable.
+
+    A result is usable when no iteration reported a correctness/execution error
+    (``result.errors is None``) and at least ``MIN_VALID_REPEATS`` iterations
+    produced a positive time. This deliberately accepts a *truncated* run
+    (``full=False`` / ``success=False``) whose only "fault" is that the kernel was
+    too slow to finish all repeats within pygpubench's budget -- those completed
+    iterations are real measurements. ``basic_stats`` already ignores the ``-1``
+    sentinels of un-run iterations. Returns ``None`` only on a genuine failure: an
+    iteration errored (``errors is not None``) or too few timings completed.
+    """
+    if result.errors is not None:
+        return None
+    valid = [t for t in result.time_us if t > 0]
+    if len(valid) < MIN_VALID_REPEATS:
         return None
     return float(pygpubench.basic_stats(result.time_us).median)
+
+
+def describe_failure(result: Any) -> str:
+    """Human-readable reason a benchmark result is unusable, for error messages.
+
+    Distinguishes the cases ``errors=None`` alone can't: a real correctness/exec
+    error vs. a kernel that merely ran too few iterations (too slow) vs. one that
+    produced no timing at all. Replaces the old bare ``errors={result.errors}``,
+    which printed a useless ``errors=None`` for the common too-slow case.
+    """
+    if result.errors is not None:
+        return f"{result.errors} iteration(s) reported a correctness/execution error"
+    valid = [t for t in result.time_us if t > 0]
+    if not valid:
+        return "no timed iteration completed (kernel crashed or was killed before timing)"
+    slowest_ms = max(valid) / 1000.0
+    return (
+        f"only {len(valid)}/{len(result.time_us)} iterations completed before "
+        f"pygpubench's per-benchmark budget (kernel too slow: ~{slowest_ms:.0f}ms/iter); "
+        f"need at least {MIN_VALID_REPEATS} for a stable measurement"
+    )
 
 
 @contextlib.contextmanager
@@ -351,7 +396,7 @@ def derive_metric(
             )
             base_median = median_us(pygpubench, base_res)
             if base_median is None:
-                return None, f"baseline '{base_q}' failed: errors={base_res.errors}"
+                return None, f"baseline '{base_q}' failed: {describe_failure(base_res)}"
         ratio = base_median / cand_median
         return (ratio * 100.0 if kind == "pct_baseline" else ratio), None
     return None, f"unknown metric.kind '{kind}'"
@@ -403,7 +448,7 @@ def _measure_baseline_impl(
                 )
                 median = median_us(pygpubench, res)
                 if median is None:
-                    return None, f"baseline '{base_q}' failed: errors={res.errors}"
+                    return None, f"baseline '{base_q}' failed: {describe_failure(res)}"
                 return median, None
             finally:
                 _cleanup_shim(base_shim_path)
@@ -595,7 +640,7 @@ def _score_impl(
                 )
                 cand_median = median_us(pygpubench, cand_res)
                 if cand_median is None:
-                    return False, None, f"submission failed correctness: errors={cand_res.errors}"
+                    return False, None, f"submission failed: {describe_failure(cand_res)}"
                 metric, err = derive_metric(
                     pygpubench,
                     problem,
