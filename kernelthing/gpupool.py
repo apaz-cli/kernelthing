@@ -1,23 +1,34 @@
-"""Cross-process GPU mutex keyed on the *physical* device UUID.
+"""The GPU pool: device discovery, lockfile naming, and the shim's environment.
 
-The GPU is a shared, serially-used resource: the authoritative benchmark and the
-agents' own build/run/profile work must never hit the same device at once
-(concurrent runs corrupt timing and can OOM). A ``threading.Semaphore`` can't
-coordinate this -- the agents are separate ``opencode`` subprocesses, and several
-kernelthing instances may target one box -- so the lock is an OS-level ``flock``
-on a file shared by everyone using that device.
+kernelthing gives each GPU-using process exclusive use of one card. The
+mechanism that enforces this -- flocking a per-card lockfile on the process's
+first CUDA call -- lives entirely in the LD_PRELOAD shim (``native/ktgpu.c``,
+whose header tells that story). Nothing in this module takes a GPU lock; it is
+everything the orchestrator does *around* the shim, before any shimmed process
+exists:
 
-The key is the device's persistent UUID (``nvidia-smi --query-gpu=uuid``), not the
-CUDA index: the index is relative to each process's ``CUDA_VISIBLE_DEVICES``
-masking/ordering, so index 0 in one process can be a different card than index 0
-in another. The UUID is invariant, so two processes that name the same GPU by
-different indices still share one lock.
+* **Identify cards** (``gpu_uuid``, ``gpu_name``, ``gpu_architecture``,
+  ``discover_gpus``, ``warm_cache``): cached ``nvidia-smi`` queries.
 
-``flock`` releases automatically when the holding fd is closed (including on
-process death), so a crashed agent or a SIGKILLed benchmark child can never wedge
-the device. The lockfile lives in the system temp dir; the orchestrator binds it
-into each agent's bubblewrap sandbox at the same path (see ``sandbox.wrap``) so
-the inode -- and therefore the lock -- is shared across the sandbox boundary.
+* **Name each card's lockfile** (``lock_path``): a per-UUID file in the system
+  temp dir, created empty here so bubblewrap can bind it into each sandbox at
+  the same path (see ``sandbox.wrap``). Every process on the box that targets
+  a card therefore flocks the same inode -- across sandboxes and across
+  kernelthing instances.
+
+* **Build the shim's environment** (``gpu_pool_spec``, ``apply_shim_env``):
+  serialize the pool as ``UUID=lockpath;...``, inject ``LD_PRELOAD``, blank
+  ``CUDA_VISIBLE_DEVICES`` (fail-closed), and set ``TORCH_CUDA_ARCH_LIST`` so
+  kernel builds never touch CUDA and can run outside the lock.
+
+* **Choose the pool and warn about it** (``candidate_gpus``,
+  ``check_architecture_mismatch``).
+
+Everything is keyed on the device's *physical* UUID (``nvidia-smi
+--query-gpu=uuid``), never the CUDA index: the index is relative to each
+process's ``CUDA_VISIBLE_DEVICES`` masking/ordering, so index 0 in one process
+can be a different card than index 0 in another. The UUID is invariant, so two
+processes that name the same GPU by different indices still share one lock.
 """
 
 from __future__ import annotations
@@ -225,9 +236,10 @@ def gpu_pool_spec(indices: list[int]) -> str:
     Consumed by the ``libktgpu.so`` LD_PRELOAD shim (``KERNELTHING_GPU_POOL``): on
     first CUDA use a shimmed process flocks the first free lockfile and pins
     ``CUDA_VISIBLE_DEVICES`` to its UUID. The lockfile paths are exactly those
-    ``lock_path`` creates, so shimmed agent processes and the Python scorer
-    serialize on the same inode. The UUID form is what ``CUDA_VISIBLE_DEVICES``
-    accepts unambiguously regardless of device enumeration order.
+    ``lock_path`` creates, so every shimmed process -- agents and the benchmark's
+    isolated worker alike -- serializes on the same inode. The UUID form is what
+    ``CUDA_VISIBLE_DEVICES`` accepts unambiguously regardless of device
+    enumeration order.
     """
     return ";".join(f"{gpu_uuid(i)}={lock_path(i)}" for i in indices)
 

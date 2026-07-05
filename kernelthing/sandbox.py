@@ -14,7 +14,7 @@ import shutil
 from collections.abc import Sequence
 from pathlib import Path
 
-from . import gpulock
+from . import gpupool
 
 # GPU control nodes shared by every device -- always bound when any GPU is used.
 NVIDIA_CTRL_NODES = [
@@ -72,7 +72,7 @@ def wrap(
     implementer's ``-s`` session persists across rounds. ``ncu``: also bind the
     GPU performance-counter capability nodes so Nsight Compute can profile.
     ``gpu_indices``: the GPU pool. Their per-device nodes are bound so kernels can
-    run, and each device's flock lockfile (``gpulock.lock_path``) is bound
+    run, and each device's flock lockfile (``gpupool.lock_path``) is bound
     read-write at its real path so the ``libktgpu.so`` shim inside the sandbox
     shares the same inode -- and therefore the same flock -- as the orchestrator's
     benchmark (the locks live under /tmp, which the sandbox otherwise masks with a
@@ -116,7 +116,7 @@ def wrap(
     # reach through the mask (same inode as the host => the shim's flock
     # coordinates with the scorer across the sandbox boundary).
     for idx in gpu_indices:
-        lock = gpulock.lock_path(idx)
+        lock = gpupool.lock_path(idx)
         if Path(lock).exists():
             args += ["--bind", str(lock), str(lock)]
 

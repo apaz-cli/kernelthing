@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from kernelthing import gpulock, opencode_client
+from kernelthing import gpupool, opencode_client
 
 REPO = Path(__file__).resolve().parent.parent
 SHIM_SRC = REPO / "kernelthing" / "native" / "ktgpu.c"
@@ -102,11 +102,12 @@ def test_shim_overrides_inherited_cvd(shim_so: str, tmp_path: Path) -> None:
 
 
 def test_shim_inherits_held_card_without_relocking(shim_so: str, tmp_path: Path) -> None:
-    # Simulate an ancestor that already locked GPU-AAA and exported it via
-    # KERNELTHING_GPU_HELD (inherited through exec). The shim must adopt that card
-    # WITHOUT taking a second flock -- even though the card's lockfile is busy.
-    # If re-entrancy were broken it would block here and the test would time out
-    # (the parent/child self-deadlock on a single-card pool).
+    # Simulate a child of a lock-holder: the ancestor locked GPU-AAA and recorded
+    # the claim in CUDA_VISIBLE_DEVICES, which the child inherits. Because the
+    # value names a pool card, the shim must adopt it WITHOUT taking a second
+    # flock -- even though the card's lockfile is busy. If inheritance were
+    # broken it would block here and the test would time out (the parent/child
+    # self-deadlock on a single-card pool).
     import fcntl
 
     a = tmp_path / "a.lock"
@@ -114,16 +115,7 @@ def test_shim_inherits_held_card_without_relocking(shim_so: str, tmp_path: Path)
     held = os.open(str(a), os.O_RDWR)
     fcntl.flock(held, fcntl.LOCK_EX)
     try:
-        argv = [sys.executable, "-c", _DRIVER, shim_so]
-        env = dict(
-            os.environ,
-            KERNELTHING_GPU_POOL=f"GPU-AAA={a}",
-            KERNELTHING_GPU_HELD="GPU-AAA",
-        )
-        env.pop("LD_PRELOAD", None)
-        proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30)
-        assert proc.returncode == 0, proc.stderr
-        out = json.loads(proc.stdout.strip())
+        out = _drive(shim_so, f"GPU-AAA={a}", preset_cvd="GPU-AAA")
     finally:
         os.close(held)
     assert out["rc"] == 0
@@ -145,22 +137,22 @@ def test_shim_inert_without_pool(shim_so: str) -> None:
 
 
 def test_gpu_pool_spec_format() -> None:
-    spec = gpulock.gpu_pool_spec([0])
+    spec = gpupool.gpu_pool_spec([0])
     assert "=" in spec
     uuid, _, lock = spec.partition("=")
-    assert uuid == gpulock.gpu_uuid(0)
-    assert lock == str(gpulock.lock_path(0))
+    assert uuid == gpupool.gpu_uuid(0)
+    assert lock == str(gpupool.lock_path(0))
 
 
 def test_build_env_injects_shim_and_pool() -> None:
-    if not gpulock.SHIM_PATH.exists():
+    if not gpupool.SHIM_PATH.exists():
         pytest.skip("shim not built")
     env, _ = opencode_client.build_opencode_env(gpu_pool=[0])
     assert env["CUDA_VISIBLE_DEVICES"] == ""
-    assert env["KERNELTHING_GPU_POOL"] == gpulock.gpu_pool_spec([0])
+    assert env["KERNELTHING_GPU_POOL"] == gpupool.gpu_pool_spec([0])
     assert "KERNELTHING_GPU_INDEX" not in env
     assert "KERNELTHING_GPU_LOCK" not in env
-    assert env["LD_PRELOAD"].split(":")[0] == str(gpulock.SHIM_PATH)
+    assert env["LD_PRELOAD"].split(":")[0] == str(gpupool.SHIM_PATH)
 
 
 def _cuda_build_toolchain() -> bool:

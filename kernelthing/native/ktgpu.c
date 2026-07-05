@@ -1,124 +1,159 @@
-/* kernelthing GPU-lock shim (LD_PRELOAD).
+/* libktgpu.so -- how kernelthing puts each process on its own GPU.
  *
- * Replaces the old cooperative `gpu_run.sh` wrapper. Instead of trusting the
- * agent to prefix GPU commands, this library is injected into every process the
- * agent spawns (LD_PRELOAD is set by the orchestrator, inherited through bash).
- * It interposes the CUDA entry points that begin device use and, on the FIRST
- * such call in a process, atomically claims a free GPU from the pool:
+ * kernelthing runs many processes that want a GPU at once: agents building and
+ * testing kernels, plus the benchmark that scores them. Two processes sharing
+ * a card corrupts timings and can OOM it, so device use must be exclusive,
+ * one process tree per card at a time.
  *
- *   1. read KERNELTHING_GPU_POOL  ("UUID=/lock/path;UUID2=/lock/path2;...")
- *   2. flock(LOCK_EX|LOCK_NB) each lockfile in turn; take the first that is free
- *      (block on the first candidate if every card is busy)
- *   3. keep the lock fd open for the process lifetime -> the flock is held until
- *      the process exits (or dies), then released by the kernel
- *   4. setenv CUDA_VISIBLE_DEVICES=<uuid> so the real CUDA init only sees that
- *      one card, then chain to the real symbol
+ * Rather than trusting each process to cooperate, the orchestrator injects
+ * this library into everything it spawns via LD_PRELOAD (inherited by all
+ * descendants), along with one variable describing the cards it may use:
  *
- * Purely CPU processes never call any CUDA entry point, so they never take a
- * lock -- this is why the shim is precise where bash-command parsing was not.
+ *     KERNELTHING_GPU_POOL=UUID=/lock/path;UUID2=/lock/path2;...
  *
- * The lockfiles are the same per-UUID files kernelthing/gpulock.py creates, so a
- * shimmed agent process and the Python scorer serialize against each other on
- * the identical inode.
+ * Each entry is a physical GPU (its nvidia-smi UUID is stable, unlike CUDA
+ * indices, which depend on each process's device masking) paired with a
+ * lockfile that stands for exclusive use of that card. The lockfiles are
+ * named and created by kernelthing/gpupool.py, and sandboxed processes get
+ * them bind-mounted at the same path, so every process on the box that
+ * targets a card -- across sandboxes and kernelthing instances -- serializes
+ * on one inode. This shim is the only code that flocks them.
  *
- * No CUDA headers required: the real symbols are resolved with dlsym(RTLD_NEXT)
- * through minimal function-pointer typedefs.
+ * That variable is the whole interface: the pool comes in through
+ * KERNELTHING_GPU_POOL, and the chosen card goes out through
+ * CUDA_VISIBLE_DEVICES. Life of a shimmed process:
+ *
+ *   load time        The constructor kt_init() inspects CUDA_VISIBLE_DEVICES.
+ *                    If it names one of the pool's cards, an ancestor claimed
+ *                    that card and this process inherits it (see "children").
+ *                    Any other value is discarded -- blanked, so CUDA sees no
+ *                    devices at all. This is the fail-closed default: a
+ *                    process launched with CUDA_VISIBLE_DEVICES=0 to dodge
+ *                    the lock gets nothing.
+ *
+ *   first CUDA call  The hooks at the bottom of this file interpose the entry
+ *                    points through which a program starts using CUDA. The
+ *                    first one called runs ktgpu_acquire(): flock() a free
+ *                    card's lockfile and set CUDA_VISIBLE_DEVICES=<its UUID>,
+ *                    so the real CUDA library initializes seeing exactly that
+ *                    one card. If every card is busy, block until one frees.
+ *
+ *   lifetime         The lock fd is left open for the life of the process.
+ *                    The kernel drops a flock when its holder exits or dies,
+ *                    so a crashed or SIGKILLed process can never wedge a card.
+ *
+ *   children         The claim is recorded in CUDA_VISIBLE_DEVICES itself,
+ *                    which children inherit; a child seeing a pool UUID there
+ *                    at load time uses that card WITHOUT locking again. This
+ *                    matters because e.g. torch touches CUDA in a parent
+ *                    process and runs the real work in a spawned child -- on
+ *                    a one-card pool the child would otherwise deadlock
+ *                    waiting on its own parent's lock. (Inheriting is
+ *                    cooperative, not a security boundary: kernelthing's
+ *                    command guard separately blocks agents from setting
+ *                    CUDA_VISIBLE_DEVICES or any KERNELTHING_* variable.)
+ *
+ *   CPU-only work    A process that never calls CUDA never triggers any of
+ *                    this and never holds a card. Hooking the CUDA calls
+ *                    themselves -- rather than guessing from command lines --
+ *                    is what makes the exclusion exactly as wide as real
+ *                    device use.
+ *
+ * If KERNELTHING_GPU_POOL is unset, the shim is inert: it touches nothing and
+ * the process behaves as if the library were never loaded.
+ *
+ * Building this needs no CUDA headers or libraries: the hooks chain to the
+ * real implementations through dlsym(RTLD_NEXT) with minimal function-pointer
+ * typedefs, and where no real implementation exists (a machine without CUDA)
+ * they are harmless stubs.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <unistd.h>
 
 #define KT_POOL_ENV "KERNELTHING_GPU_POOL"
-#define KT_HELD_ENV "KERNELTHING_GPU_HELD"
-#define KT_MAX_UUID 128
+#define KT_POOL_MAX 64 /* max cards parsed from the pool */
 
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
-static int g_lock_fd = -1;             /* held open for process lifetime (-1 if inherited) */
-static int g_acquired = 0;             /* resolved a card: own flock OR inherited from ancestor */
-static char g_uuid[KT_MAX_UUID] = {0}; /* chosen device UUID, for diagnostics */
+static int g_acquired = 0; /* this process has a card (own lock or inherited) */
+static int g_lock_fd = -1; /* open forever: the flock lives as long as the fd */
 
-/* Try to claim one lockfile. Returns an open, flock-held fd or -1.
- * When block!=0 the flock is blocking (waits for the card); otherwise LOCK_NB. */
+/* Parse "UUID=/lock/path;..." into parallel arrays, in place (the uuid/path
+ * pointers point into buf, which must outlive them). Malformed entries are
+ * skipped. Returns the number of cards found. */
+static int kt_parse_pool(char *buf, char *uuid[], char *path[]) {
+  int n = 0;
+  char *save = NULL;
+  for (char *tok = strtok_r(buf, ";", &save); tok && n < KT_POOL_MAX;
+       tok = strtok_r(NULL, ";", &save)) {
+    char *eq = strchr(tok, '=');
+    if (!eq || eq == tok || !eq[1]) continue;
+    *eq = '\0';
+    uuid[n] = tok;
+    path[n] = eq + 1;
+    n++;
+  }
+  return n;
+}
+
+/* Try to take the exclusive flock on one lockfile. Returns the open fd holding
+ * the lock, or -1. When block==0 a busy lock fails immediately (LOCK_NB);
+ * when block!=0 we wait for it. */
 static int kt_try_lock(const char *path, int block) {
   int fd = open(path, O_RDWR | O_CREAT, 0666);
   if (fd < 0) return -1;
-  int op = LOCK_EX | (block ? 0 : LOCK_NB);
-  if (flock(fd, op) != 0) {
+  if (flock(fd, LOCK_EX | (block ? 0 : LOCK_NB)) != 0) {
     close(fd);
     return -1;
   }
   return fd;
 }
 
-/* Core allocation: parse the pool, claim a card, pin CUDA_VISIBLE_DEVICES.
- * Idempotent-safe to call once (guarded by pthread_once in the hooks). Exposed
+/* Make *uuid* this process's card: pin CUDA_VISIBLE_DEVICES so the real CUDA
+ * library sees only that device -- and so descendants inherit the claim. */
+static void kt_claim(const char *uuid, int lock_fd) {
+  g_lock_fd = lock_fd;
+  setenv("CUDA_VISIBLE_DEVICES", uuid, 1);
+  g_acquired = 1;
+}
+
+/* Lock a card from the pool for this process. Called once, from the first
+ * hooked CUDA call (the inherited-card case was already settled at load time
+ * by kt_init, which sets g_acquired). Returns 0 once a card is pinned, -1 if
+ * there is no pool (shim inert) or nothing could be locked. Exposed
  * (non-static) so the test harness can drive it without a real CUDA install. */
 int ktgpu_acquire(void) {
-  if (g_acquired) return 0; /* already resolved a card for this process */
-
-  /* Re-entrancy across a process subtree: if an ancestor already flocked a card
-   * (it exports the UUID in KERNELTHING_GPU_HELD, inherited through exec), adopt
-   * that same card instead of taking a *second* flock. This is essential because
-   * pygpubench/torch run the real GPU work in a spawned child: the parent that
-   * first touches CUDA (e.g. torch's device-capability probe when building)
-   * holds the lock for the whole subtree, so on a single-card pool the child
-   * would otherwise deadlock waiting on a card its own parent is holding. We
-   * don't hold an fd here -- the ancestor's fd keeps the flock alive. */
-  const char *held = getenv(KT_HELD_ENV);
-  if (held && *held) {
-    snprintf(g_uuid, sizeof(g_uuid), "%s", held);
-    setenv("CUDA_VISIBLE_DEVICES", held, 1);
-    g_acquired = 1;
-    return 0;
-  }
+  if (g_acquired) return 0;
 
   const char *pool = getenv(KT_POOL_ENV);
-  if (!pool || !*pool) return -1; /* no pool configured -> fail open (no-op) */
+  if (!pool || !*pool) return -1;
 
   char *buf = strdup(pool);
   if (!buf) return -1;
+  char *uuid[KT_POOL_MAX], *path[KT_POOL_MAX];
+  int n = kt_parse_pool(buf, uuid, path);
 
-  char *first_uuid = NULL, *first_path = NULL;
-
-  /* Non-blocking pass: take the first free card. */
-  char *save = NULL;
-  for (char *tok = strtok_r(buf, ";", &save); tok; tok = strtok_r(NULL, ";", &save)) {
-    char *eq = strchr(tok, '=');
-    if (!eq) continue;
-    *eq = '\0';
-    char *uuid = tok, *path = eq + 1;
-    if (!*uuid || !*path) continue;
-    if (!first_uuid) {
-      first_uuid = uuid;
-      first_path = path;
-    }
-    int fd = kt_try_lock(path, 0);
+  /* First pass: probe every card without waiting; take the first free one. */
+  for (int i = 0; i < n; i++) {
+    int fd = kt_try_lock(path[i], 0);
     if (fd >= 0) {
-      g_lock_fd = fd;
-      g_acquired = 1;
-      snprintf(g_uuid, sizeof(g_uuid), "%s", uuid);
-      setenv("CUDA_VISIBLE_DEVICES", uuid, 1);
-      setenv(KT_HELD_ENV, uuid, 1); /* descendants adopt this card, don't re-lock */
+      kt_claim(uuid[i], fd);
       free(buf);
       return 0;
     }
   }
 
-  /* Every card busy: block on the first candidate (matches gpulock.pick_free_gpu). */
-  if (first_path) {
-    int fd = kt_try_lock(first_path, 1);
+  /* Every card busy: wait on the first one -- everyone queues on a
+   * deterministic card rather than racing across all of them. */
+  if (n > 0) {
+    int fd = kt_try_lock(path[0], 1);
     if (fd >= 0) {
-      g_lock_fd = fd;
-      g_acquired = 1;
-      snprintf(g_uuid, sizeof(g_uuid), "%s", first_uuid);
-      setenv("CUDA_VISIBLE_DEVICES", first_uuid, 1);
-      setenv(KT_HELD_ENV, first_uuid, 1); /* descendants adopt this card, don't re-lock */
+      kt_claim(uuid[0], fd);
       free(buf);
       return 0;
     }
@@ -131,31 +166,46 @@ int ktgpu_acquire(void) {
 static void kt_acquire_once(void) { (void)ktgpu_acquire(); }
 static void kt_ensure(void) { pthread_once(&g_once, kt_acquire_once); }
 
-/* Runs at library load, before main() and before any CUDA call.
+/* Runs when the library is loaded -- before main(), before any CUDA call.
+ * Decides what the inherited CUDA_VISIBLE_DEVICES means:
  *
- * If an ancestor already holds a card (KERNELTHING_GPU_HELD inherited through
- * exec), pin CUDA_VISIBLE_DEVICES to it right away so this process sees that one
- * card even before its first hooked call fires.
+ *   - names a card in the pool -> an ancestor claimed it; adopt it. We take
+ *     no lock and hold no fd (the ancestor's open fd keeps the flock alive).
+ *   - anything else -> discard it (fail-closed: no device is reachable until
+ *     ktgpu_acquire() pins the one card we lock).
  *
- * Otherwise, if a pool is configured, neutralize any CUDA_VISIBLE_DEVICES
- * inherited from the launching command (e.g. an agent trying
- * `CUDA_VISIBLE_DEVICES=0 python ...` to dodge the lock): blank it so no device
- * is reachable until ktgpu_acquire() pins the one card we lock. When no pool is
- * configured the shim is inert and leaves the environment untouched. */
+ * Only the environment is settled here -- locking itself waits for the first
+ * CUDA call, so CPU-only processes never take a card. */
 __attribute__((constructor)) static void kt_init(void) {
-  const char *held = getenv(KT_HELD_ENV);
-  if (held && *held) {
-    setenv("CUDA_VISIBLE_DEVICES", held, 1);
-    return;
-  }
   const char *pool = getenv(KT_POOL_ENV);
-  if (pool && *pool) setenv("CUDA_VISIBLE_DEVICES", "", 1);
+  if (!pool || !*pool) return; /* no pool configured -> shim is inert */
+
+  const char *cvd = getenv("CUDA_VISIBLE_DEVICES");
+  if (cvd && *cvd) {
+    char *buf = strdup(pool);
+    if (buf) {
+      char *uuid[KT_POOL_MAX], *path[KT_POOL_MAX];
+      int n = kt_parse_pool(buf, uuid, path);
+      for (int i = 0; i < n; i++) {
+        if (strcmp(cvd, uuid[i]) == 0) {
+          g_acquired = 1; /* inherited card, already pinned */
+          free(buf);
+          return;
+        }
+      }
+      free(buf);
+    }
+  }
+  setenv("CUDA_VISIBLE_DEVICES", "", 1);
 }
 
-/* --- interposed CUDA entry points --------------------------------------------
- * Each hook claims a card (once) before chaining to the real implementation.
- * We hook both the driver API (cuInit and the cuGetProcAddress trampoline used
- * by modern libcudart) and the earliest runtime API calls torch makes. */
+/* ---- The interposed CUDA entry points --------------------------------------
+ *
+ * Every hook has the same shape: make sure this process has a card, then chain
+ * to the real CUDA function, found with dlsym(RTLD_NEXT) ("the next library
+ * after us that defines this name"). We hook the driver API's cuInit plus the
+ * earliest runtime-API calls torch makes, so whichever path a program enters
+ * CUDA through, acquisition happens first. */
 
 #define KT_NEXT(fnptr_type, name)                    \
   static fnptr_type real = NULL;                     \
@@ -189,9 +239,11 @@ int cudaMalloc(void **ptr, size_t size) {
   return real ? real(ptr, size) : 0;
 }
 
-/* libcudart (CUDA 11.3+) fetches driver symbols through cuGetProcAddress rather
- * than the dynamic linker, which would bypass our cuInit hook; intercept the
- * lookup and hand back our wrapper instead. Both the v1 and v2 ABIs are covered. */
+/* libcudart (CUDA 11.3+) looks driver symbols up through cuGetProcAddress
+ * instead of the dynamic linker, which would hand it the real cuInit and
+ * bypass the hook above. So we interpose the lookup itself: run the real
+ * lookup, then substitute our cuInit wrapper for the result. v1 and v2 are
+ * the two ABIs of the same function; both must be covered. */
 typedef int (*cuGetProcAddress_t)(const char *, void **, int, unsigned long long);
 int cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion,
                      unsigned long long flags) {

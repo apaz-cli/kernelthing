@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import gpulock
+from . import gpupool
 from .problem import Problem
 
 # Protects the process-global env vars (CUDA_VISIBLE_DEVICES / LD_PRELOAD /
@@ -332,7 +332,7 @@ def _gpu_env(gpu_pool: list[int]) -> Generator[None, None, None]:
     keys = ("CUDA_VISIBLE_DEVICES", "LD_PRELOAD", "KERNELTHING_GPU_POOL")
     saved = {k: os.environ.get(k) for k in keys}
     with _env_lock:
-        gpulock.apply_shim_env(os.environ, gpu_pool, overwrite_pool=False)
+        gpupool.apply_shim_env(os.environ, gpu_pool, overwrite_pool=False)
         try:
             yield
         finally:

@@ -62,9 +62,10 @@ class Config:
 
     # --- GPU pool ---
     # Pool of CUDA device indices the loop may use (--gpu 0 --gpu 1 / --gpu 0,1);
-    # tasks go to the least-busy device. Exclusivity is a per-device flock
-    # (kernelthing/gpulock.py), not in-process state, so agents and the bench never
-    # share a card -- even across separate kernelthing processes on the same GPU.
+    # tasks go to the least-busy device. Exclusivity is a per-device flock taken
+    # by the libktgpu.so shim (lockfiles named in kernelthing/gpupool.py), not
+    # in-process state, so agents and the bench never share a card -- even
+    # across separate kernelthing processes on the same GPU.
     gpu_indices: list[int] = field(default_factory=lambda: [0])
 
     # --- agent tools & sandboxing ---

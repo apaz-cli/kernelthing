@@ -33,11 +33,11 @@ def _check_gpu_model(problem: Problem, gpus: list[int]) -> str | None:
     """
     if not problem.gpu:
         return None
-    from . import gpulock
+    from . import gpupool
 
     bad: list[str] = []
     for idx in gpus:
-        name = gpulock.gpu_name(idx)
+        name = gpupool.gpu_name(idx)
         if name != problem.gpu:
             bad.append(f"  GPU {idx}: {name}")
     if not bad:
@@ -173,12 +173,12 @@ def run_loop(args: argparse.Namespace) -> int:
         problem_root=args.problem_root,
     )
 
-    from . import gpulock
+    from . import gpupool
 
-    gpulock.warm_cache(gpus)
+    gpupool.warm_cache(gpus)
 
     if not args.override_gpu:
-        arch_warning = gpulock.check_architecture_mismatch(gpus)
+        arch_warning = gpupool.check_architecture_mismatch(gpus)
         if arch_warning:
             print(arch_warning, file=sys.stderr)
             ans = input("[kernelthing] Proceed anyway? [y/N] ").strip().lower()
@@ -248,7 +248,7 @@ def score_command(argv: list[str]) -> int:
     model as the default device (``CUDA_VISIBLE_DEVICES``/GPU 0) is used, falling
     back to a blocking lock on GPU 0 if all are busy.
     """
-    from . import bench, gpulock
+    from . import bench, gpupool
 
     p = argparse.ArgumentParser(
         prog="kernelthing score",
@@ -294,19 +294,19 @@ def score_command(argv: list[str]) -> int:
             return 2
 
     if args.gpu:
-        pool = gpulock.candidate_gpus(preferred=args.gpu)
+        pool = gpupool.candidate_gpus(preferred=args.gpu)
     elif problem.gpu:
-        pool = gpulock.candidate_gpus(model=problem.gpu)
+        pool = gpupool.candidate_gpus(model=problem.gpu)
     else:
         default_index = default_gpu()[0]
-        pool = gpulock.candidate_gpus(
-            model=gpulock.gpu_name(default_index),
-            arch=gpulock.gpu_architecture(default_index),
+        pool = gpupool.candidate_gpus(
+            model=gpupool.gpu_name(default_index),
+            arch=gpupool.gpu_architecture(default_index),
         )
     # Compile the kernel off-lock first (pure host-side nvcc, no GPU): the shimmed
     # pygpubench worker then reuses the cached .so instead of compiling while
     # holding the card, so the lock covers only the actual run.
-    bench.warm_build(problem, problem.repo_root, arch=gpulock.torch_arch_list(pool))
+    bench.warm_build(problem, problem.repo_root, arch=gpupool.torch_arch_list(pool))
 
     # Baseline denominator for pct_baseline/speedup: pin the one passed in, or (with
     # --emit-baseline) measure it once here and report it so the caller can pin it

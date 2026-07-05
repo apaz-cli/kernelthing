@@ -104,12 +104,13 @@ and exploration targets empty niches so the search can't collapse onto one linea
 round count. `-j` sets max concurrent agents; all GPU work stays serialized.
 
 **Automatic GPU allocation.** Access to the GPU pool is mediated by a per-device
-`flock` (`kernelthing/gpulock.py`) keyed on the physical GPU **UUID** (not the CUDA
-index, which is relative to each process's `CUDA_VISIBLE_DEVICES`). The authoritative
-benchmark takes the lock in-process; agent processes take it transparently through an
-`LD_PRELOAD` shim (`kernelthing/native/ktgpu.c` → `libktgpu.so`): on the first CUDA
-call, the shim flocks a free card from the pool, pins `CUDA_VISIBLE_DEVICES` to it for
-that process's lifetime, and blocks only if every card is busy. Purely CPU commands
+`flock` keyed on the physical GPU **UUID** (not the CUDA index, which is relative to
+each process's `CUDA_VISIBLE_DEVICES`); lockfiles are named in `kernelthing/gpupool.py`.
+All locking happens transparently in an `LD_PRELOAD` shim (`kernelthing/native/ktgpu.c`
+→ `libktgpu.so`) injected into every spawned process — agents and the benchmark's
+worker alike: on the first CUDA call, the shim flocks a free card from the pool, pins
+`CUDA_VISIBLE_DEVICES` to it for that process's lifetime, and blocks only if every
+card is busy. Purely CPU commands
 never trigger it, so builds and analysis don't hold a GPU. There is no wrapper for the
 agent to remember and nothing to opt into — and the guard blocks any attempt to set
 `CUDA_VISIBLE_DEVICES`/`LD_PRELOAD` or otherwise touch the mechanism, so an agent can't

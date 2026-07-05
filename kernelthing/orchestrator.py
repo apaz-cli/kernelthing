@@ -508,10 +508,10 @@ class Orchestrator:
         """Worker: fork a worktree, run one agent turn, then (serialized) score it.
 
         Pure git plumbing is taken under ``self._git_lock``; the agent turn and the
-        benchmark run outside it. GPU exclusivity is handled by the per-device
-        flock (kernelthing/gpulock.py): the agent's processes claim a card via the
-        ``libktgpu.so`` LD_PRELOAD shim, and ``_guarded_score`` holds it for the
-        bench. Returns the scored Member; never raises.
+        benchmark run outside it. GPU exclusivity is handled by the ``libktgpu.so``
+        LD_PRELOAD shim: the agent's processes and the bench's isolated worker
+        each flock a per-device lockfile (named in kernelthing/gpupool.py) on
+        first CUDA use. Returns the scored Member; never raises.
         """
         m = evolve.Member(id=task.member_id, operator=task.operator, parent_id=task.parent_id)
         parent_commit = task.parent_commit or base

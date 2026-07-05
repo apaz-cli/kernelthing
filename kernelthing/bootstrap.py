@@ -27,7 +27,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import bench, gates, gpulock, opencode_client, prompts
+from . import bench, gates, gpupool, opencode_client, prompts
 from .config import MARKER_COMPLETE, MARKER_SETUP_BLOCKED, Config
 from .problem import Problem, git_toplevel, load_problem
 from .state import new_timestamp
@@ -313,8 +313,8 @@ def bootstrap_problem(
 
     # Lock this problem to the GPU model it was authored on.
     from .problem import set_gpu_model
-    set_gpu_model(target, gpulock.gpu_name(cfg.gpu_indices[0]))
-    print(f"[bootstrap] locked problem to GPU: {gpulock.gpu_name(cfg.gpu_indices[0])}", file=sys.stderr)
+    set_gpu_model(target, gpupool.gpu_name(cfg.gpu_indices[0]))
+    print(f"[bootstrap] locked problem to GPU: {gpupool.gpu_name(cfg.gpu_indices[0])}", file=sys.stderr)
 
     commit_problem(target, repo_root)
     return target

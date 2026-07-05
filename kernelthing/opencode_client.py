@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import gpulock, sandbox
+from . import gpupool, sandbox
 
 # The PreToolUse guard plugin and the block-message templates it renders.
 GUARD_PLUGIN = Path(__file__).resolve().parent / "oc_guard" / "guard.js"
@@ -97,7 +97,7 @@ def build_opencode_env(
     rather than an unlocked one.
     """
     env = dict(os.environ)
-    gpulock.apply_shim_env(env, gpu_pool)
+    gpupool.apply_shim_env(env, gpu_pool)
 
     oc_config: dict[str, Any] = {"snapshot": False}
     if guard is not None:
