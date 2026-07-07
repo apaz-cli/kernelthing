@@ -27,7 +27,8 @@ from __future__ import annotations
 import math
 import random
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 # operators
 OP_EXPLORE = "explore"
@@ -54,6 +55,17 @@ class Member:
     error: str | None = None
     children: int = 0  # tasks dispatched from this member (bandit visits)
     status: str = ST_DEAD
+    # --- provenance / accounting (persisted to members/<id>/result.json) ---
+    gpu: int | None = None
+    cost: float = 0.0  # USD spent on the agent turn
+    tokens: dict[str, Any] = field(default_factory=dict)
+    tool_calls: int = 0
+    agent_exit: int | None = None  # opencode exit code (124 = turn timed out)
+    commits: list[str] = field(default_factory=list)  # every commit made ("<sha> <subject>")
+    changed_files: list[str] = field(default_factory=list)  # everything the turn committed
+    agent_s: float | None = None  # agent turn wall time
+    score_s: float | None = None  # benchmark wall time
+    score_detail: dict[str, Any] = field(default_factory=dict)  # raw bench/guard record
 
     @property
     def viable(self) -> bool:
@@ -64,6 +76,30 @@ class Member:
         if not self.commit_message:
             return "uncategorized"
         return re.sub(r"\s+", " ", self.commit_message.strip().lower())[:60]
+
+    def record(self) -> dict[str, Any]:
+        """Flat serializable result -- the ``member_result`` journal event and
+        ``members/<id>/result.json`` share this shape."""
+        return {
+            "member": self.id,
+            "op": self.operator,
+            "parent": self.parent_id,
+            "commit": self.commit,
+            "message": self.commit_message,
+            "correct": self.correct,
+            "metric": self.metric,
+            "error": self.error,
+            "gpu": self.gpu,
+            "cost": round(self.cost, 6),
+            "tokens": self.tokens,
+            "tool_calls": self.tool_calls,
+            "agent_exit": self.agent_exit,
+            "commits": self.commits,
+            "changed_files": self.changed_files,
+            "agent_s": self.agent_s,
+            "score_s": self.score_s,
+            "score": self.score_detail or None,
+        }
 
 
 @dataclass

@@ -17,7 +17,7 @@ def _orch(tmp_path):
         edit_files=["k.cu"],
         score_command="echo",
     )
-    return Orchestrator(prob, Config(kernelguard=True), bus=None)
+    return Orchestrator(prob, Config(kernelguard=True))
 
 
 def test_cheat_disqualified_without_scoring(tmp_path, monkeypatch):
@@ -25,18 +25,19 @@ def test_cheat_disqualified_without_scoring(tmp_path, monkeypatch):
     monkeypatch.setattr(gates, "kernelguard_violations", lambda *a, **k: [{"file": "k.cu"}])
     scored = []
     monkeypatch.setattr(
-        orch, "_score_worktree", lambda wt, **kw: scored.append(wt) or (True, 99.0, None)
+        orch, "_score_worktree", lambda wt, **kw: scored.append(wt) or (True, 99.0, None, {})
     )
-    correct, metric, err = orch._guarded_score(tmp_path)
+    correct, metric, err, detail = orch._guarded_score(tmp_path)
     assert correct is False
     assert metric is None
     assert err.startswith("kernelguard")
+    assert detail["kernelguard"] == [{"file": "k.cu"}]  # full violation record kept
     assert scored == []
 
 
 def test_clean_candidate_is_scored(tmp_path, monkeypatch):
     orch = _orch(tmp_path)
     monkeypatch.setattr(gates, "kernelguard_violations", lambda *a, **k: [])
-    monkeypatch.setattr(orch, "_score_worktree", lambda wt, **kw: (True, 99.0, None))
-    correct, metric, err = orch._guarded_score(tmp_path)
+    monkeypatch.setattr(orch, "_score_worktree", lambda wt, **kw: (True, 99.0, None, {}))
+    correct, metric, err, _detail = orch._guarded_score(tmp_path)
     assert correct is True and metric == 99.0 and err is None

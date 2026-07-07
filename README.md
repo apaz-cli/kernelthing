@@ -63,17 +63,29 @@ the best of all-correct runs. Hold your own problems to the same standard.
 
 ## Web UI
 
-`http://127.0.0.1:<port>` (stdlib-only, zero deps). Live search view:
+`http://127.0.0.1:<port>` (stdlib-only, zero deps). The UI is fully decoupled
+from the run: every run journals everything it does to its run dir
+(`.humanize/rlcr/<ts>/` — `run.json`, an append-only `events.ndjson`, and
+`members/<id>/` with each candidate's exact prompt, agent transcript, diff,
+summary, and result/cost record), and the server is a pure reader of those
+dirs. The run picker lists every run — live or finished — so old runs replay
+with the full chart/lineage/leaderboard, and `events.ndjson` can be debugged
+with `tail`/`grep`/`jq`.
 
 - **Best vs. submitted** — best-so-far staircase chart with each attempt a dot
   colored by operator (explore/exploit), failures marked.
 - **Agents (live)** — cards showing operator, parent, tool-call count, cost, and
   the latest tool call + reasoning line from the streaming opencode log. Click for
   full transcript.
-- **Niches** (MAP-Elites: best per strategy), **Lineage** (parent→child mutation
-  tree), **Leaderboard** with self-triage (fixable/fundamental + estimated ceiling).
+- **Lineage** (parent→child mutation tree), **Leaderboard** (with per-candidate
+  cost), and a **member detail pane** (transcript / prompt / diff / summary /
+  result).
+- Live-tunable controls (parallelism, budgets, explore bias, stop) flow through
+  the run dir's `control.json`, re-read by the loop at dispatch boundaries —
+  only shown while the run holds its `live.lock`.
 
-Disable with `--no-web`.
+Disable with `--no-web`, or serve all runs standalone (no loop needed) with
+`kernelthing web [--root ~/.cache/kernelthing]`.
 
 ## Search strategy: 
 

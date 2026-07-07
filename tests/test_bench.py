@@ -126,7 +126,7 @@ def _problem(root):
 
 def test_score_correct_kernel_pct_baseline(tmp_path, fake_pygpubench):
     _write_problem_dir(tmp_path)
-    correct, metric, err = bench.score(_problem(tmp_path), tmp_path)
+    correct, metric, err, _detail = bench.score(_problem(tmp_path), tmp_path)
     assert correct and err is None
     # baseline 20us / candidate 10us * 100 == 200 %baseline
     assert metric == pytest.approx(200.0)
@@ -134,7 +134,7 @@ def test_score_correct_kernel_pct_baseline(tmp_path, fake_pygpubench):
 
 def test_score_wrong_kernel_is_incorrect(tmp_path, fake_pygpubench):
     _write_problem_dir(tmp_path, kernel_body="return x * 3")  # wrong output
-    correct, metric, err = bench.score(_problem(tmp_path), tmp_path)
+    correct, metric, err, _detail = bench.score(_problem(tmp_path), tmp_path)
     assert correct is False and metric is None and err
 
 
@@ -142,5 +142,5 @@ def test_score_latency_metric(tmp_path, fake_pygpubench):
     _write_problem_dir(tmp_path)
     prob = _problem(tmp_path)
     prob.metric = {"kind": "latency_us"}
-    correct, metric, _err = bench.score(prob, tmp_path)
+    correct, metric, _err, _detail = bench.score(prob, tmp_path)
     assert correct and metric == pytest.approx(10.0)

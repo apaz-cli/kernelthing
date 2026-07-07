@@ -1,29 +1,31 @@
-"""Embedded stdlib web UI for watching/controlling a running loop.
+"""Standalone stdlib web UI: a pure reader of run directories.
 
-Zero dependencies: a ThreadingHTTPServer in a daemon thread serves a single HTML
-page that polls ``/api/status`` and renders the live evolutionary search -- a
-fitness chart (best vs. kernels submitted), the in-flight agents (each streaming
-its exact tool calls), the lineage tree, and a leaderboard. Shares a
-:class:`LoopBus` with the loop.
+Zero dependencies: a ThreadingHTTPServer serving a single HTML page. The server
+is pointed at a *root* directory (the managed problem root by default) and
+discovers every run under it -- live or finished -- by scanning for
+``.humanize/rlcr/<timestamp>/run.json``. Nothing is shared with the run process:
+the loop writes its journal/artifacts to the run dir (see journal.py/state.py)
+and this server only reads them, so the same UI replays an old run or follows a
+live one. It runs embedded in ``kernelthing`` (a daemon thread) and standalone
+as ``kernelthing web``.
 
-The agents stream for free: every opencode turn writes its NDJSON event log to a
-per-agent file *as it arrives*. The controller can't see inside a running turn
-(it blocks on the subprocess), but this server can tail the file -- so
-``/api/status`` enriches each in-flight agent with the live tool/text summary of
-its log, and ``/api/candlog`` returns the full readable transcript on demand.
+The one write path is control: POST /api/control updates the run's
+``control.json`` (rejected with 409 when the run is not live), which the loop
+re-reads at dispatch boundaries.
 
-Endpoints:
-  * ``GET  /            `` -- the page (served from disk, editable live)
-  * ``GET  /app.js      `` -- client-side JavaScript (served from disk)
-  * ``GET  /api/status  `` -- the snapshot, agents enriched with live log tails
-  * ``GET  /api/log     `` -- the controller narrative (loop.log)
-  * ``GET  /api/candlog?file=`` -- one agent's full transcript (basename-restricted)
-  * ``POST /api/control `` -- stop / set parallelism / set turn cap
+Endpoints (run ids are the run dir's path relative to the root):
+  * ``GET  /                 `` -- the page (served from disk, editable live)
+  * ``GET  /app.js           `` -- client-side JavaScript (served from disk)
+  * ``GET  /api/runs         `` -- all discovered runs, newest first
+  * ``GET  /api/events?run=&offset=`` -- journal events from a byte offset
+  * ``GET  /api/log?run=     `` -- the controller narrative (loop.log)
+  * ``GET  /api/agents?run=&ids=`` -- live tool/text/cost summary per member
+  * ``GET  /api/member?run=&id=&file=`` -- one member artifact (transcript/...)
+  * ``POST /api/control?run= `` -- stop / budgets / parallelism / explore bias
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,9 +33,20 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from ..bus import LoopBus  # re-exported for callers that import from kernelthing.webui
+from .. import journal
 
 _WEBUI_DIR = Path(__file__).resolve().parent
+
+# Member artifacts a client may fetch verbatim; "transcript" is the rendered
+# view of opencode.ndjson and handled separately.
+MEMBER_FILES = {
+    "prompt": "prompt.md",
+    "summary": "summary.md",
+    "diff": "diff.patch",
+    "result": "result.json",
+    "log": "opencode.ndjson",
+    "stderr": "stderr.log",
+}
 
 
 def tail_text(path: Path, nbytes: int = 262144) -> str:
@@ -118,12 +131,12 @@ def summarize_agent_log(path: Path) -> dict[str, Any]:
     return out
 
 
-def candlog_text(path: Path, lines: int = 400) -> str:
+def transcript_text(path: Path, lines: int = 800) -> str:
     """Full readable transcript of an agent's NDJSON log (text + tool lines)."""
     if not path.is_file():
-        return "(no log yet)"
+        return "(no transcript yet)"
     out = []
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines()[-4000:]:
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines()[-8000:]:
         raw = raw.strip()
         if not raw:
             continue
@@ -139,7 +152,9 @@ def candlog_text(path: Path, lines: int = 400) -> str:
     return "\n".join(out[-lines:]) or "(no text yet)"
 
 
-def make_handler(bus: LoopBus) -> type[BaseHTTPRequestHandler]:
+def make_handler(root: Path) -> type[BaseHTTPRequestHandler]:
+    root = Path(root).resolve()
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
             if args and len(args) >= 2 and isinstance(args[1], int) and args[1] >= 400:
@@ -153,8 +168,17 @@ def make_handler(bus: LoopBus) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(data)
 
+        def _run_dir(self, q: dict[str, list[str]]) -> Path | None:
+            """The validated run dir for ?run=<id>, or None (404 already sent)."""
+            run_id = (q.get("run") or [""])[0]
+            d = journal.run_dir_of(root, run_id)
+            if d is None:
+                self._send(404, json.dumps({"error": "unknown run"}))
+            return d
+
         def do_GET(self) -> None:
             u = urlparse(self.path)
+            q = parse_qs(u.query)
             if u.path == "/":
                 self._send(
                     200,
@@ -167,70 +191,113 @@ def make_handler(bus: LoopBus) -> type[BaseHTTPRequestHandler]:
                     (_WEBUI_DIR / "app.js").read_text(encoding="utf-8"),
                     "application/javascript; charset=utf-8",
                 )
-            elif u.path == "/api/status":
-                snap = bus.snapshot()
-                loop_dir = Path(bus.loop_dir())
-                if str(loop_dir):
-                    for a in snap.get("agents", []):
-                        lf = a["log_file"]
-                        if lf:
-                            a.update(summarize_agent_log(loop_dir / Path(lf).name))
-                self._send(200, json.dumps(snap))
+            elif u.path == "/api/runs":
+                self._send(200, json.dumps(journal.discover_runs(root)))
+            elif u.path == "/api/events":
+                d = self._run_dir(q)
+                if d is None:
+                    return
+                try:
+                    offset = max(0, int((q.get("offset") or ["0"])[0]))
+                except ValueError:
+                    offset = 0
+                events, new_offset = journal.read_events(d / journal.EVENTS_NDJSON, offset)
+                self._send(
+                    200,
+                    json.dumps(
+                        {"events": events, "offset": new_offset, "live": journal.is_live(d)}
+                    ),
+                )
             elif u.path == "/api/log":
-                loop_dir = Path(bus.loop_dir())
-                lf = loop_dir / "loop.log"
+                d = self._run_dir(q)
+                if d is None:
+                    return
+                lf = d / "loop.log"
                 txt = (
                     lf.read_text(encoding="utf-8", errors="replace")
                     if lf.is_file()
                     else "(no log yet)"
                 )
                 self._send(200, txt, "text/plain; charset=utf-8")
-            elif u.path == "/api/candlog":
-                q = parse_qs(u.query)
-                loop_dir = Path(bus.loop_dir())
-                name = (q.get("file") or [""])[0]
-                target = loop_dir / Path(name).name if str(loop_dir) and name else None
-                self._send(
-                    200,
-                    candlog_text(target) if target else "(no file)",
-                    "text/plain; charset=utf-8",
-                )
+            elif u.path == "/api/agents":
+                d = self._run_dir(q)
+                if d is None:
+                    return
+                ids = []
+                for part in (q.get("ids") or [""])[0].split(","):
+                    if part.strip().isdigit():
+                        ids.append(int(part))
+                out = {
+                    str(i): summarize_agent_log(d / "members" / str(i) / "opencode.ndjson")
+                    for i in ids[:64]
+                }
+                self._send(200, json.dumps(out))
+            elif u.path == "/api/member":
+                d = self._run_dir(q)
+                if d is None:
+                    return
+                mid = (q.get("id") or [""])[0]
+                which = (q.get("file") or ["transcript"])[0]
+                if not mid.isdigit():
+                    self._send(404, "bad member id", "text/plain")
+                    return
+                mdir = d / "members" / str(int(mid))
+                if which == "transcript":
+                    self._send(
+                        200, transcript_text(mdir / "opencode.ndjson"), "text/plain; charset=utf-8"
+                    )
+                elif which in MEMBER_FILES:
+                    f = mdir / MEMBER_FILES[which]
+                    txt = (
+                        f.read_text(encoding="utf-8", errors="replace")
+                        if f.is_file()
+                        else f"(no {MEMBER_FILES[which]})"
+                    )
+                    self._send(200, txt, "text/plain; charset=utf-8")
+                else:
+                    self._send(404, "unknown file", "text/plain")
             else:
                 self._send(404, "not found", "text/plain")
 
         def do_POST(self) -> None:
-            if urlparse(self.path).path != "/api/control":
+            u = urlparse(self.path)
+            if u.path != "/api/control":
                 self._send(404, "not found", "text/plain")
+                return
+            q = parse_qs(u.query)
+            d = self._run_dir(q)
+            if d is None:
+                return
+            if not journal.is_live(d):
+                self._send(409, json.dumps({"error": "run is not live"}))
                 return
             n = int(self.headers.get("Content-Length", 0))
             try:
                 body = json.loads(self.rfile.read(n) or b"{}")
             except json.JSONDecodeError:
                 body = {}
-            if "parallelism" in body:
-                bus.set_parallelism(body["parallelism"])
-            if "wall_clock" in body:
+            body = body if isinstance(body, dict) else {}
+            if "wall_clock" in body:  # human form ("10m") from the UI input
                 from ..config import parse_duration
 
-                with contextlib.suppress(ValueError, TypeError):
-                    bus.set_wall_clock(parse_duration(body["wall_clock"]))
-            if "explore_bias" in body:
-                bus.set_explore_bias(body["explore_bias"])
-            if "explore_auto" in body:
-                bus.set_explore_auto()
-            if "max_candidates" in body:
-                bus.set_max_candidates(body["max_candidates"])
-            if body.get("stop"):
-                bus.request_stop()
-            self._send(200, json.dumps({"ok": True}))
+                try:
+                    body["wall_clock_s"] = parse_duration(body.pop("wall_clock"))
+                except (ValueError, TypeError):
+                    body.pop("wall_clock", None)
+            new = journal.update_control(d / journal.CONTROL_JSON, body)
+            self._send(200, json.dumps({"ok": True, "control": new}))
 
     return Handler
 
 
+def make_server(root: Path, port: int = 8765, host: str = "127.0.0.1") -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), make_handler(root))
+
+
 def start_server(
-    bus: LoopBus, port: int = 8765, host: str = "127.0.0.1"
+    root: Path, port: int = 8765, host: str = "127.0.0.1"
 ) -> tuple[ThreadingHTTPServer, int]:
     """Start the web UI in a daemon thread; returns (httpd, actual_port)."""
-    httpd = ThreadingHTTPServer((host, port), make_handler(bus))
+    httpd = make_server(root, port, host)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, httpd.server_address[1]

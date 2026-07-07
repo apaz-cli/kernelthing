@@ -1,6 +1,7 @@
+import json
 from pathlib import Path
 
-from kernelthing.state import LoopDirs, State, new_timestamp, save_state
+from kernelthing.state import LoopDirs, State, new_timestamp, save_run
 
 
 def _make_state(ts: str) -> State:
@@ -14,34 +15,34 @@ def _make_state(ts: str) -> State:
     )
 
 
-def test_state_json_round_trip():
-    ts = new_timestamp()
-    s = _make_state(ts)
-    s2 = State.from_json(s.to_json())
-    assert s2 == s
-
-
-def test_state_from_json_ignores_unknown_keys():
-    ts = new_timestamp()
-    s = _make_state(ts)
-    blob = s.to_json().rstrip().rstrip("}") + ', "future_field": 99}'
-    s2 = State.from_json(blob)
-    assert s2.start_branch == "main"
-
-
-def test_save_and_load(tmp_path: Path):
+def test_save_run_writes_run_json(tmp_path: Path):
     ts = new_timestamp()
     dirs = LoopDirs(tmp_path, ts).ensure()
-    s = _make_state(ts)
-    save_state(dirs, s)
-    assert dirs.state_file.is_file()
-    loaded = State.from_json(dirs.state_file.read_text(encoding="utf-8"))
-    assert loaded == s
+    save_run(dirs, _make_state(ts), problem={"name": "gemm", "unit": "us"})
+    data = json.loads(dirs.run_json.read_text(encoding="utf-8"))
+    assert data["timestamp"] == ts
+    assert data["base_commit"] == "abc1234"
+    assert data["problem"] == {"name": "gemm", "unit": "us"}
 
 
-def test_loopdirs_artifact_names(tmp_path: Path):
+def test_loopdirs_layout(tmp_path: Path):
     ts = "2026-06-04_00-00-00"
     d = LoopDirs(tmp_path, ts)
-    assert d.summary(2).name == "round-2-summary.md"
-    assert d.prompt(3).name == "round-3-prompt.md"
     assert str(d.base).endswith(f".humanize/rlcr/{ts}")
+    assert d.run_json.name == "run.json"
+    assert d.events_file.name == "events.ndjson"
+    assert d.control_file.name == "control.json"
+    assert d.live_lock.name == "live.lock"
+    assert d.logfile.name == "loop.log"
+    assert d.member_dir(3) == d.base / "members" / "3"
+    assert d.member_prompt(3).name == "prompt.md"
+    assert d.member_log(3).name == "opencode.ndjson"
+    assert d.member_summary(3).name == "summary.md"
+    assert d.member_diff(3).name == "diff.patch"
+    assert d.member_result(3).name == "result.json"
+
+
+def test_ensure_member_creates_dir(tmp_path: Path):
+    d = LoopDirs(tmp_path, new_timestamp()).ensure()
+    md = d.ensure_member(7)
+    assert md.is_dir() and md == d.member_dir(7)

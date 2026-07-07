@@ -1,8 +1,21 @@
-"""Loop state + per-round artifact layout.
+"""Run-directory layout + in-memory run state.
 
-State lives in ``<working_dir>/.humanize/rlcr/<timestamp>/`` mirroring Humanize's
-on-disk layout, but the structured state is a single ``state.json`` (the
-orchestrator owns it, so there is no YAML-frontmatter schema to reconstruct).
+A run's artifacts live in ``<working_dir>/.humanize/rlcr/<timestamp>/`` and are
+fully self-describing (see journal.py for the journal/control/liveness files):
+
+    run.json            immutable run metadata (problem, config, git baseline)
+    events.ndjson       append-only journal of everything that happened
+    control.json        live-tunable knobs (web UI writes, loop reads)
+    live.lock           flock held by the run process (liveness probe)
+    loop.log            human-readable controller narrative
+    plan.md             backup of the plan file
+    members/<id>/       everything about one candidate:
+        prompt.md           the exact rendered prompt the agent received
+        opencode.ndjson     the agent's full NDJSON event transcript
+        stderr.log          the opencode process's stderr (crash traces)
+        summary.md          the agent's candidate-summary.md
+        diff.patch          git diff parent..commit (survives ref cleanup)
+        result.json         score verdict + raw bench timings + cost/tokens
 """
 
 from __future__ import annotations
@@ -12,6 +25,9 @@ import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+
+from .journal import CONTROL_JSON, EVENTS_NDJSON, LIVE_LOCK, RUN_JSON
 
 
 def utcnow() -> str:
@@ -24,7 +40,8 @@ def new_timestamp() -> str:
 
 @dataclass
 class State:
-    """Serializable loop state (the JSON analogue of Humanize's state.md)."""
+    """In-memory run bookkeeping; persisted (with problem/config metadata) as
+    part of ``run.json`` -- see ``save_run``."""
 
     timestamp: str
     plan_file: str
@@ -35,15 +52,6 @@ class State:
     current_round: int = 0
     methodology: bool = False
     started_at: str = field(default_factory=utcnow)
-
-    def to_json(self) -> str:
-        return json.dumps(dataclasses.asdict(self), indent=2)
-
-    @classmethod
-    def from_json(cls, text: str) -> State:
-        data = json.loads(text)
-        known = {f.name for f in dataclasses.fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 class LoopDirs:
@@ -57,23 +65,62 @@ class LoopDirs:
         self.base.mkdir(parents=True, exist_ok=True)
         return self
 
-    # --- core files ---
+    # --- run-level files ---
     @property
-    def state_file(self) -> Path:
-        return self.base / "state.json"
+    def run_json(self) -> Path:
+        return self.base / RUN_JSON
+
+    @property
+    def events_file(self) -> Path:
+        return self.base / EVENTS_NDJSON
+
+    @property
+    def control_file(self) -> Path:
+        return self.base / CONTROL_JSON
+
+    @property
+    def live_lock(self) -> Path:
+        return self.base / LIVE_LOCK
+
+    @property
+    def logfile(self) -> Path:
+        return self.base / "loop.log"
 
     @property
     def plan_backup(self) -> Path:
         return self.base / "plan.md"
 
-    # --- per-round files ---
-    def prompt(self, rnd: int) -> Path:
-        return self.base / f"round-{rnd}-prompt.md"
+    # --- per-member files ---
+    def member_dir(self, member_id: int) -> Path:
+        return self.base / "members" / str(int(member_id))
 
-    def summary(self, rnd: int) -> Path:
-        return self.base / f"round-{rnd}-summary.md"
+    def ensure_member(self, member_id: int) -> Path:
+        d = self.member_dir(member_id)
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def member_prompt(self, member_id: int) -> Path:
+        return self.member_dir(member_id) / "prompt.md"
+
+    def member_log(self, member_id: int) -> Path:
+        return self.member_dir(member_id) / "opencode.ndjson"
+
+    def member_stderr(self, member_id: int) -> Path:
+        return self.member_dir(member_id) / "stderr.log"
+
+    def member_summary(self, member_id: int) -> Path:
+        return self.member_dir(member_id) / "summary.md"
+
+    def member_diff(self, member_id: int) -> Path:
+        return self.member_dir(member_id) / "diff.patch"
+
+    def member_result(self, member_id: int) -> Path:
+        return self.member_dir(member_id) / "result.json"
 
 
-def save_state(dirs: LoopDirs, state: State) -> None:
+def save_run(dirs: LoopDirs, state: State, **extra: Any) -> None:
+    """Write ``run.json``: the State fields plus caller-provided metadata blocks
+    (problem/config), so a run dir is interpretable with no other context."""
     dirs.ensure()
-    dirs.state_file.write_text(state.to_json(), encoding="utf-8")
+    data = {**dataclasses.asdict(state), **extra}
+    dirs.run_json.write_text(json.dumps(data, indent=2), encoding="utf-8")

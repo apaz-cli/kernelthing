@@ -33,6 +33,14 @@ function underProject(cfg, abs) {
   return abs === root || abs.startsWith(root + path.sep);
 }
 
+// Files the loop itself owns inside the run dir (see kernelthing/journal.py).
+const RUN_FILES = ["state.json", "run.json", "events.ndjson", "control.json", "live.lock"];
+
+function inMembers(cfg, abs) {
+  const membersDir = path.join(path.normalize(cfg.loopDir), "members");
+  return abs === membersDir || abs.startsWith(membersDir + path.sep);
+}
+
 const RE_TODOS = /round-\d+-todos\.md$/;
 const RE_PROMPT = /round-\d+-prompt\.md$/;
 const RE_REVIEW_PROMPT = /round-\d+-review-prompt\.md$/;
@@ -168,13 +176,18 @@ function checkWriteLike(cfg, filePath, resultingContent) {
     return block(cfg, "prompt-file-write", {}, "You cannot write to round-*-prompt.md files.");
   }
 
-  // Loop state files.
+  // Loop state files: the run metadata, the event journal, the control channel,
+  // the liveness lock, and the per-member artifact store are all loop-managed.
   if (nameLower === "finalize-state.json" && inLoop(cfg, abs)) {
     return block(cfg, "finalize-state-file-modification", {},
       "You cannot modify finalize-state.json; it is managed by the loop.");
   }
-  if (nameLower === "state.json" && inLoop(cfg, abs)) {
-    return block(cfg, "state-file-modification", {}, "You cannot modify the loop state file.");
+  if (RUN_FILES.includes(nameLower) && inLoop(cfg, abs)) {
+    return block(cfg, "state-file-modification", {}, "You cannot modify the loop state files.");
+  }
+  if (inMembers(cfg, abs)) {
+    return block(cfg, "state-file-modification", {},
+      "You cannot modify the loop's members/ artifact store; it is managed by the loop.");
   }
 
   // Plan backup inside the loop dir.
@@ -234,8 +247,9 @@ function checkRead(cfg, filePath) {
   // Methodology phase: read only sanitized artifacts; no project files.
   if (cfg.phase === "methodology") {
     if (inLoop(cfg, abs)) {
-      const ok = ["methodology-analysis-report.md", "methodology-analysis-done.md", "state.json"];
-      if (ok.includes(nameLower) || RE_SUMMARY.test(nameLower) || /round-\d+-review-result\.md$/.test(nameLower) || nameLower === "loop.log") {
+      const ok = ["methodology-analysis-report.md", "methodology-analysis-done.md",
+                  "run.json", "events.ndjson", "loop.log"];
+      if (ok.includes(nameLower) || inMembers(cfg, abs)) {
         return null; // the retrospective is allowed to read the development records
       }
       return block(cfg, null, {},
@@ -286,8 +300,8 @@ function checkBash(cfg, command) {
   if (gitAddsHumanize(c)) {
     return block(cfg, "git-add-humanize", {}, "Do not git-add the .humanize loop-state directory; stage specific files instead.");
   }
-  if (commandModifiesFile(c, "state\\.json")) {
-    return block(cfg, "state-file-modification", {}, "Do not modify the loop state file via bash.");
+  if (commandModifiesFile(c, "(state\\.json|run\\.json|events\\.ndjson|control\\.json)")) {
+    return block(cfg, "state-file-modification", {}, "Do not modify the loop state files via bash.");
   }
   if (commandModifiesFile(c, "round-\\d+-todos\\.md")) {
     return block(cfg, "todos-file-access", {},

@@ -11,6 +11,7 @@ opencode 1.15.13 facts this relies on (see README):
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -180,6 +181,7 @@ def run(
     writable: bool = True,
     sandboxed: bool = True,
     log_path: Path | None = None,
+    err_path: Path | None = None,
     data_dir: Path | None = None,
     extra_writable: list[Path] | tuple[Path, ...] = (),
     guard: dict[str, Any] | None = None,
@@ -189,8 +191,10 @@ def run(
 
     The NDJSON event stream is written to ``log_path`` *as it arrives* (stdout is
     redirected straight to that file), so a long turn can be watched live with
-    ``tail -f``. The prompt is fed from a temp file on stdin; because both stdin
-    and stdout are real files (not pipes), there is no pipe-buffer deadlock.
+    ``tail -f``. ``err_path`` does the same for opencode's stderr (crash traces,
+    API errors) -- without it stderr is discarded. The prompt is fed from a temp
+    file on stdin; because both stdin and stdout are real files (not pipes),
+    there is no pipe-buffer deadlock.
 
     ``data_dir``: isolate opencode's XDG data/state/cache here (its own SQLite
     DB) instead of the shared default -- required when running several sessions
@@ -259,12 +263,19 @@ def run(
 
     returncode = 0
     try:
-        with open(prompt_name) as stdin_fh, open(out_name, "w") as out_fh:
+        with contextlib.ExitStack() as stack:
+            stdin_fh = stack.enter_context(open(prompt_name))
+            out_fh = stack.enter_context(open(out_name, "w"))
+            if err_path is not None:
+                Path(err_path).parent.mkdir(parents=True, exist_ok=True)
+                err_target: Any = stack.enter_context(open(err_path, "w", encoding="utf-8"))
+            else:
+                err_target = subprocess.DEVNULL
             proc = subprocess.Popen(
                 argv,
                 stdin=stdin_fh,
                 stdout=out_fh,
-                stderr=subprocess.PIPE,
+                stderr=err_target,
                 text=True,
                 env=env,
             )

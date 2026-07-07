@@ -58,11 +58,6 @@ main {
   flex-direction: column;
   gap: 14px;
 }
-.row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 14px;
-}
 .card {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -108,13 +103,33 @@ td.num { text-align: right }
 .good { color: var(--exploit) }
 .bad { color: var(--bad) }
 .muted { color: var(--mut) }
-input {
-  width: 64px;
+input, select {
   background: var(--bg);
   color: var(--ink);
   border: 1px solid var(--line);
   border-radius: 4px;
   padding: 4px;
+}
+input { width: 64px }
+select { max-width: 380px }
+
+/* diff coloring (member detail pane, diff tab) */
+.d-add { color: var(--exploit) }
+.d-del { color: var(--bad) }
+.d-hunk { color: var(--explore) }
+.d-meta { color: var(--mut) }
+
+/* live-tunable knobs: amber = edited but not yet applied */
+.knobs { display: inline-flex; gap: 6px; align-items: center }
+.knobs label { color: var(--mut); font-size: 12px; white-space: nowrap }
+.knob.dirty { border-color: #e3b341 }
+#applyBtn { visibility: hidden }
+#applyBtn.dirty {
+  visibility: visible;
+  background: #e3b341;
+  border-color: #e3b341;
+  color: #0e1116;
+  font-weight: 600;
 }
 button {
   background: #238636;
@@ -151,6 +166,7 @@ pre {
   word-break: break-word;
 }
 svg { display: block; width: 100% }
+.live-dot { color: var(--exploit) }
 
 /* operator badge */
 .op {
@@ -235,31 +251,43 @@ svg { display: block; width: 100% }
   margin-right: 4px;
   vertical-align: middle;
 }
+.tabs { display: inline-flex; gap: 6px }
 .hidden { display: none }
 </style>
 </head>
 <body>
 <header>
   <h1>kernelthing</h1>
+  <select id=runSel onchange="selectRun(this.value)" title="pick a run — live or finished"></select>
   <span class=pill id=problem>—</span>
   <span class=pill id=phase>phase —</span>
   <span class=pill id=best>best —</span>
   <span class=pill id=kernels>0 kernels</span>
   <span class=pill id=agentsN>0 agents</span>
+  <span class=pill id=cost>$0.00</span>
   <span class=pill id=clock>⏱ —</span>
   <span class=grow></span>
   <span id=ctl class=muted style=font-size:12px></span>
-  <span id=exploreCtl>explore
-    <input id=E type=range min=0 max=100 value=50 style=width:80px;vertical-align:middle
-           title="explore/exploit bias — auto-schedule adjusts this over time">
-    exploit <b id=Eb>50</b>
-    <button class=mini id=Eauto onclick=autoE() title="re-enable auto-schedule">auto</button>
+  <span id=liveCtls>
+    <span id=exploreCtl>explore
+      <input id=E type=range min=0 max=100 value=50 style=width:80px;vertical-align:middle
+             title="explore/exploit bias — auto-schedule adjusts this over time">
+      exploit <b id=Eb>50</b>
+      <button class=mini id=Eauto onclick=autoE() title="re-enable auto-schedule">auto</button>
+    </span>
+    <span class=knobs title="edit any of these, then Enter or apply — amber means uncommitted, Esc reverts">
+      <label>agents <input id=J class=knob type=number min=1 max=64 style=width:48px
+             title="-j parallelism: agents editing at once (up or down, takes effect within ~15s)"></label>
+      <label>elites <input id=K class=knob type=number min=1 style=width:48px
+             title="-k elite_k: size of the top-K exploit frontier"></label>
+      <label>candidates <input id=M class=knob type=number min=0 style=width:56px
+             title="-m budget: total candidates to dispatch (0 = unlimited)"></label>
+      <label>wall clock <input id=W class=knob type=text style=width:56px
+             title="-w budget: wall clock, e.g. 10m, 2h, 1d (0 = off)"></label>
+      <button class=mini id=applyBtn onclick=applyKnobs()>apply</button>
+    </span>
+    <button class=stop onclick=stop()>Stop</button>
   </span>
-  <span id=clockCtl>limit <input id=W type=text title="wall-clock limit, e.g. 10m, 2h, 1d — 0 = off">
-    <button class=mini onclick=setW()>set</button></span>
-  <span id=candCtl>cands <input id=M type=number min=0 value=0 style=width:50px>
-    <button class=mini onclick=setM()>set</button></span>
-  <button class=stop onclick=stop()>Stop</button>
 </header>
 <main>
   <div class=card>
@@ -284,14 +312,19 @@ svg { display: block; width: 100% }
 
   <div class=card id=lbCard><h2>Leaderboard</h2>
     <table><thead><tr><th>#</th><th>mem</th><th class=num>metric</th><th>op</th><th>message</th>
-      <th>parent</th><th>commit</th></tr></thead><tbody id=lb></tbody></table></div>
+      <th>parent</th><th>commit</th><th class=num>$</th></tr></thead><tbody id=lb></tbody></table></div>
 
-  <div class="card hidden" id=sbCard><h2>Scoreboard</h2>
-    <table><thead><tr><th>cand</th><th>status</th><th class=num>metric</th><th>commit</th><th>note</th></tr></thead>
-    <tbody id=sb></tbody></table>
-    <div id=candbtns style=margin-top:8px></div></div>
-
-  <div class=card><h2>Transcript <span class=sub id=txWho>select an agent</span></h2><pre id=tx>—</pre></div>
+  <div class=card><h2>
+    <span>Member <span class=sub id=txWho>select an agent or member</span></span>
+    <span class=tabs id=txTabs>
+      <button class="mini active" data-tab=transcript onclick=setTab('transcript')>transcript</button>
+      <button class=mini data-tab=prompt onclick=setTab('prompt')>prompt</button>
+      <button class=mini data-tab=diff onclick=setTab('diff')>diff</button>
+      <button class=mini data-tab=summary onclick=setTab('summary')>summary</button>
+      <button class=mini data-tab=result onclick=setTab('result')>result</button>
+      <button class=mini data-tab=stderr onclick=setTab('stderr')>stderr</button>
+    </span></h2>
+    <pre id=tx>—</pre></div>
   <div class=card><h2>Controller log</h2><pre id=log>—</pre></div>
 </main>
 <script src="app.js"></script>

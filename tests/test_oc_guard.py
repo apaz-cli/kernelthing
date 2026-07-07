@@ -61,6 +61,34 @@ def test_write_state_file_blocked(tmp_path):
     assert r["blocked"] and "State File" in r["message"]
 
 
+def test_write_run_files_blocked(tmp_path):
+    cfg = _cfg(tmp_path)
+    for name in ("run.json", "events.ndjson", "control.json", "live.lock"):
+        r = _decide(cfg, "write", {"filePath": _loop_path(cfg, name), "content": "{}"})
+        assert r["blocked"], name
+
+
+def test_write_members_store_blocked(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(
+        cfg, "write", {"filePath": _loop_path(cfg, "members", "3", "result.json"), "content": "{}"}
+    )
+    assert r["blocked"]
+
+
+def test_bash_redirect_to_events_blocked(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "echo x >> .humanize/rlcr/x/events.ndjson"})
+    assert r["blocked"]
+
+
+def test_methodology_allows_member_records_read(tmp_path):
+    cfg = _cfg(tmp_path, phase="methodology")
+    for rel in (("members", "3", "summary.md"), ("events.ndjson",), ("loop.log",)):
+        r = _decide(cfg, "read", {"filePath": _loop_path(cfg, *rel)})
+        assert not r["blocked"], rel
+
+
 def test_write_finalize_state_blocked(tmp_path):
     cfg = _cfg(tmp_path, phase="finalize")
     r = _decide(cfg, "write", {"filePath": _loop_path(cfg, "finalize-state.json"), "content": "{}"})

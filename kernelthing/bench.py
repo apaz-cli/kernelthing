@@ -562,6 +562,19 @@ def warm_build(problem: Problem, worktree: Path, *, timeout: int | None = None, 
             )
 
 
+def bench_detail(cand_median: float | None, result: Any, repeats: int) -> dict[str, Any]:
+    """The raw measurement behind a score: every completed repeat's time plus the
+    derived median. Persisted alongside the metric (result.json / the journal) so
+    benchmark noise and truncated runs can be inspected after the fact."""
+    valid = [round(float(t), 2) for t in result.time_us if t > 0]
+    return {
+        "median_us": cand_median,
+        "timings_us": valid,
+        "completed": len(valid),
+        "repeats": repeats,
+    }
+
+
 def score(
     problem: Problem,
     worktree: Path,
@@ -569,14 +582,15 @@ def score(
     baseline_median: float | None = None,
     gpu_index: int = 0,
     gpu_pool: list[int] | None = None,
-) -> tuple[bool, float | None, str | None]:
+) -> tuple[bool, float | None, str | None, dict[str, Any]]:
     """Benchmark the worktree's submission through pygpubench.
 
-    Returns ``(correct, metric, err)`` -- the same tuple the legacy
-    ``_score_worktree`` returns, so the orchestrator treats both scoring paths
-    identically. ``correct`` is pygpubench's ``result.success`` (every repeat
-    passed correctness within tolerance). Repeats are pygpubench's job (its
-    ``repeats`` arg), so the orchestrator does not loop this call.
+    Returns ``(correct, metric, err, detail)``. ``correct`` is pygpubench's
+    ``result.success`` (every repeat passed correctness within tolerance).
+    Repeats are pygpubench's job (its ``repeats`` arg), so the orchestrator does
+    not loop this call. ``detail`` is the raw measurement record
+    (``bench_detail``: per-repeat timings, median, completed count) -- empty when
+    the benchmark never produced timings.
 
     ``baseline_median`` (us): a pinned denominator for ``pct_baseline`` /
     ``speedup`` metrics. When given, the baseline reference kernel is NOT
@@ -591,12 +605,12 @@ def score(
         with _gpu_env(pool):
             return _score_impl(problem, worktree, baseline_median)
     except Exception as e:
-        return False, None, explain_bench_error(e)
+        return False, None, explain_bench_error(e), {}
 
 
 def _score_impl(
     problem: Problem, worktree: Path, baseline_median: float | None
-) -> tuple[bool, float | None, str | None]:
+) -> tuple[bool, float | None, str | None, dict[str, Any]]:
     """Body of ``score`` — runs inside ``_gpu_env`` so torch sees the GPU at import time."""
     try:
         import pygpubench
@@ -605,14 +619,15 @@ def _score_impl(
             False,
             None,
             (f"pygpubench not installed (pip install 'kernelthing[pygpubench]'): {e!r}"),
+            {},
         )
 
     qualname = (problem.bench or {}).get("submission_qualname")
     if not qualname:
-        return False, None, "problem.bench.submission_qualname is required"
+        return False, None, "problem.bench.submission_qualname is required", {}
     s = resolve_bench_config(problem, worktree)
     if not s.prob_dir.is_dir():
-        return False, None, f"problem dir not found in worktree: {s.prob_dir}"
+        return False, None, f"problem dir not found in worktree: {s.prob_dir}", {}
 
     try:
         with _importable(s.prob_dir):
@@ -639,8 +654,9 @@ def _score_impl(
                     writable_paths=writable,
                 )
                 cand_median = median_us(pygpubench, cand_res)
+                detail = bench_detail(cand_median, cand_res, s.repeats)
                 if cand_median is None:
-                    return False, None, f"submission failed: {describe_failure(cand_res)}"
+                    return False, None, f"submission failed: {describe_failure(cand_res)}", detail
                 metric, err = derive_metric(
                     pygpubench,
                     problem,
@@ -655,11 +671,11 @@ def _score_impl(
                     writable_paths=writable,
                 )
                 if err:
-                    return True, None, err
-                return True, metric, None
+                    return True, None, err, detail
+                return True, metric, None, detail
             finally:
                 _cleanup_shim(sub_shim_path)
                 if base_shim_path:
                     _cleanup_shim(base_shim_path)
     except Exception as e:
-        return False, None, explain_bench_error(e)
+        return False, None, explain_bench_error(e), {}

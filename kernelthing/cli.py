@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 from . import bootstrap
-from .bus import LoopBus
 from .config import Config
 from .orchestrator import Orchestrator
 from .problem import Problem, load_problem, prepare_problem
@@ -197,17 +196,14 @@ def run_loop(args: argparse.Namespace) -> int:
             print(gpu_err, file=sys.stderr)
             return 2
 
-    bus = None
     if not args.no_web:
         from . import webui
 
-        bus = LoopBus(args.parallelism, args.wall_clock, args.max_candidates)
         try:
-            _httpd, port = webui.start_server(bus, port=args.web_port)
+            _httpd, port = webui.start_server(cfg.problem_root, port=args.web_port)
             print(f"[kernelthing] web UI:   http://127.0.0.1:{port}", file=sys.stderr)
         except OSError as e:
             print(f"[kernelthing] web UI disabled ({e}); continuing headless", file=sys.stderr)
-            bus = None
     else:
         print("[kernelthing] running headless (--no-web)", file=sys.stderr)
 
@@ -224,7 +220,7 @@ def run_loop(args: argparse.Namespace) -> int:
     )
     print(f"[kernelthing] gpus:      {gpu_str}", file=sys.stderr)
 
-    orch = Orchestrator(problem, cfg, bus)
+    orch = Orchestrator(problem, cfg)
     try:
         exit_reason = orch.run()
     except KeyboardInterrupt:
@@ -324,18 +320,58 @@ def score_command(argv: list[str]) -> int:
     # worker the libktgpu.so LD_PRELOAD shim together with this candidate pool. The
     # shim probes the pool for a free card and flocks it for the worker's lifetime.
     # No in-process flock here -- taking one would deadlock against the shim's.
-    correct, metric, err = bench.score(
+    correct, metric, err, detail = bench.score(
         problem, problem.repo_root, gpu_pool=pool, baseline_median=baseline_median
     )
-    result.update({"correct": correct, "metric": metric, "error": err})
+    result.update({"correct": correct, "metric": metric, "error": err, "bench": detail})
     print(json.dumps(result))
     return 0 if correct else 1
+
+
+def web_command(argv: list[str]) -> int:
+    """``kernelthing web``: serve the web UI standalone over a directory of runs.
+
+    Discovers every run (live or finished) under ``--root`` -- each run dir is
+    self-describing on disk (run.json / events.ndjson / members/), so no run
+    process needs to be alive. Use it to inspect old runs, or as a single UI
+    over several concurrent ``kernelthing --no-web`` runs.
+    """
+    from . import webui
+
+    p = argparse.ArgumentParser(
+        prog="kernelthing web",
+        description="Serve the kernelthing web UI over a directory of runs "
+        "(live and finished). Runs live in <root>/<problem>/.humanize/rlcr/.",
+    )
+    p.add_argument(
+        "--root",
+        type=Path,
+        default=Path.home() / ".cache" / "kernelthing",
+        help="directory to discover runs under (default: %(default)s)",
+    )
+    p.add_argument("--port", type=int, default=8765, help="port (default: %(default)s)")
+    p.add_argument("--host", default="127.0.0.1", help="bind address (default: %(default)s)")
+    args = p.parse_args(argv)
+
+    httpd = webui.make_server(args.root, port=args.port, host=args.host)
+    print(
+        f"[kernelthing] web UI: http://{args.host}:{httpd.server_address[1]}  "
+        f"(runs from {args.root})",
+        file=sys.stderr,
+    )
+    import contextlib
+
+    with contextlib.suppress(KeyboardInterrupt):
+        httpd.serve_forever()
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "score":
         return score_command(argv[1:])
+    if argv and argv[0] == "web":
+        return web_command(argv[1:])
 
     parser = argparse.ArgumentParser(
         prog="kernelthing",
@@ -344,7 +380,9 @@ def main(argv: list[str] | None = None) -> int:
         epilog="subcommands:\n"
         "  score [<dir>]   score a problem dir with the authoritative benchmark and\n"
         "                  print {correct, metric, unit} -- the same scoring the loop\n"
-        "                  uses; run `kernelthing score --help` for details",
+        "                  uses; run `kernelthing score --help` for details\n"
+        "  web             serve the web UI standalone over all runs (live and\n"
+        "                  finished) under --root; run `kernelthing web --help`",
     )
     parser.add_argument(
         "problem",
@@ -355,22 +393,25 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     search = parser.add_argument_group(
-        "search budget & shape", "how long the evolutionary search runs and how wide it goes"
+        "search budget & shape",
+        "how long the evolutionary search runs and how wide it goes; "
+        "-j/-k/-m/-w are all live-tunable from the web UI while the run is going",
     )
     search.add_argument(
         "-j",
         "--parallelism",
         type=int,
         default=4,
-        help="max agents editing at once (live-tunable down in the web UI; "
-        "the GPU benchmark stays serial). Default 4.",
+        help="max agents editing at once (live-tunable up and down in the web "
+        "UI; the GPU benchmark stays serial). Default 4.",
     )
     search.add_argument(
         "-k",
         "--elite-k",
         type=int,
         default=4,
-        help="size of the top-K frontier (the exploit pool). Default 4.",
+        help="size of the top-K frontier (the exploit pool); live-tunable "
+        "in the web UI. Default 4.",
     )
     search.add_argument(
         "--min-niches",
@@ -384,8 +425,8 @@ def main(argv: list[str] | None = None) -> int:
         "--max-candidates",
         type=int,
         default=24,
-        help="budget: total candidates to dispatch, then stop. "
-        "0 = run until --wall-clock / web-UI stop. Default 24.",
+        help="budget: total candidates to dispatch, then stop. 0 = run until "
+        "--wall-clock / web-UI stop. Live-tunable in the web UI. Default 24.",
     )
     search.add_argument(
         "-w",
@@ -395,7 +436,7 @@ def main(argv: list[str] | None = None) -> int:
         metavar="DUR",
         help="budget: wall-clock duration, then stop. Accepts an s/m/h/d/w "
         "suffix (e.g. 10m, 2h, 1d); a bare number is seconds. 0 = off. "
-        "Default 0.",
+        "Live-tunable in the web UI. Default 0.",
     )
 
     models = parser.add_argument_group("model")
