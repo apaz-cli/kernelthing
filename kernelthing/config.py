@@ -49,7 +49,7 @@ class Config:
     """Run-time knobs for one loop invocation."""
 
     model: str = "deepseek/deepseek-v4-pro"
-    opencode_timeout: int = 1200
+    opencode_timeout: int = 3600
 
     # --- search budget & shape ---
     # ``-j``: max agents editing at once (the GPU benchmark stage stays serialized).
@@ -67,6 +67,15 @@ class Config:
     # in-process state, so agents and the bench never share a card -- even
     # across separate kernelthing processes on the same GPU.
     gpu_indices: list[int] = field(default_factory=lambda: [0])
+
+    # --- GPU hardware control (reproducible benchmarking) ---
+    # Set power limit (watts) before the seed baseline. Requires root.
+    # ``None`` = don't change.
+    power_limit: int | None = None
+    # Lock GPU core clock to ``(min_mhz, max_mhz)``. Requires root + idle GPU.
+    gpu_clock_lock: tuple[int, int] | None = None
+    # Lock GPU memory clock to ``(min_mhz, max_mhz)``. Requires root + idle GPU.
+    mem_clock_lock: tuple[int, int] | None = None
 
     # --- agent tools & sandboxing ---
     sandbox: bool = True

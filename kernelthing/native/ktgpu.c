@@ -31,12 +31,15 @@
  *                    process launched with CUDA_VISIBLE_DEVICES=0 to dodge
  *                    the lock gets nothing.
  *
- *   first CUDA call  The hooks at the bottom of this file interpose the entry
- *                    points through which a program starts using CUDA. The
- *                    first one called runs ktgpu_acquire(): flock() a free
- *                    card's lockfile and set CUDA_VISIBLE_DEVICES=<its UUID>,
- *                    so the real CUDA library initializes seeing exactly that
- *                    one card. If every card is busy, block until one frees.
+ *   first CUDA use   The hooks at the bottom of this file interpose the two
+ *                    roads into the GPU driver: dlopen() of libcuda (how the
+ *                    CUDA runtime, ctypes-style bindings, and torch load it)
+ *                    and cuInit() (for programs linked against libcuda
+ *                    directly). The first one hit runs ktgpu_acquire():
+ *                    flock() a free card's lockfile and set
+ *                    CUDA_VISIBLE_DEVICES=<its UUID>, so the driver
+ *                    initializes seeing exactly that one card. If every card
+ *                    is busy, block until one frees.
  *
  *   lifetime         The lock fd is left open for the life of the process.
  *                    The kernel drops a flock when its holder exits or dies,
@@ -53,11 +56,13 @@
  *                    command guard separately blocks agents from setting
  *                    CUDA_VISIBLE_DEVICES or any KERNELTHING_* variable.)
  *
- *   CPU-only work    A process that never calls CUDA never triggers any of
- *                    this and never holds a card. Hooking the CUDA calls
- *                    themselves -- rather than guessing from command lines --
- *                    is what makes the exclusion exactly as wide as real
- *                    device use.
+ *   CPU-only work    A process that never reaches for the driver never
+ *                    triggers any of this and never holds a card -- including
+ *                    torch imports and builds, whose libraries load libcuda
+ *                    only to resolve symbols (see the dlopen hook's nesting
+ *                    rule). Hooking the road to the driver itself -- rather
+ *                    than guessing from command lines -- is what makes the
+ *                    exclusion exactly as wide as real device use.
  *
  * If KERNELTHING_GPU_POOL is unset, the shim is inert: it touches nothing and
  * the process behaves as if the library were never loaded.
@@ -115,7 +120,15 @@ static int kt_try_lock(const char *path, int block) {
 }
 
 /* Make *uuid* this process's card: pin CUDA_VISIBLE_DEVICES so the real CUDA
- * library sees only that device -- and so descendants inherit the claim. */
+ * library sees only that device -- and so descendants inherit the claim.
+ *
+ * setenv() updates the C environment only. A Python process that claims
+ * mid-run keeps its stale os.environ snapshot (CVD="" from kt_init), with two
+ * consequences: torch's NVML-based device_count() reports 0 there (though
+ * is_available() and allocation work), and passing env=dict(os.environ) to a
+ * subprocess launders the claim away -- the child locks a *second* card, which
+ * on a one-card pool means deadlocking on its own parent. Children spawned
+ * with the default (C) environment inherit correctly. */
 static void kt_claim(const char *uuid, int lock_fd) {
   g_lock_fd = lock_fd;
   setenv("CUDA_VISIBLE_DEVICES", uuid, 1);
@@ -123,7 +136,7 @@ static void kt_claim(const char *uuid, int lock_fd) {
 }
 
 /* Lock a card from the pool for this process. Called once, from the first
- * hooked CUDA call (the inherited-card case was already settled at load time
+ * hook hit below (the inherited-card case was already settled at load time
  * by kt_init, which sets g_acquired). Returns 0 once a card is pinned, -1 if
  * there is no pool (shim inert) or nothing could be locked. Exposed
  * (non-static) so the test harness can drive it without a real CUDA install. */
@@ -175,7 +188,7 @@ static void kt_ensure(void) { pthread_once(&g_once, kt_acquire_once); }
  *     ktgpu_acquire() pins the one card we lock).
  *
  * Only the environment is settled here -- locking itself waits for the first
- * CUDA call, so CPU-only processes never take a card. */
+ * sign of CUDA use, so CPU-only processes never take a card. */
 __attribute__((constructor)) static void kt_init(void) {
   const char *pool = getenv(KT_POOL_ENV);
   if (!pool || !*pool) return; /* no pool configured -> shim is inert */
@@ -199,66 +212,61 @@ __attribute__((constructor)) static void kt_init(void) {
   setenv("CUDA_VISIBLE_DEVICES", "", 1);
 }
 
-/* ---- The interposed CUDA entry points --------------------------------------
+/* ---- The interposed entry points --------------------------------------------
  *
- * Every hook has the same shape: make sure this process has a card, then chain
- * to the real CUDA function, found with dlsym(RTLD_NEXT) ("the next library
- * after us that defines this name"). We hook the driver API's cuInit plus the
- * earliest runtime-API calls torch makes, so whichever path a program enters
- * CUDA through, acquisition happens first. */
+ * Acquisition must happen before the driver initializes: libcuda reads
+ * CUDA_VISIBLE_DEVICES once, in the process's first cuInit(), and the device
+ * set is fixed from then on. Two hooks cover every road there:
+ *
+ * dlopen -- everything not linked against libcuda loads it with
+ * dlopen("libcuda.so.1"): the CUDA runtime (the shared libcudart AND the
+ * static cudart that nvcc links by default), ctypes/numba-style bindings,
+ * torch's driver-API shim. Interposing CUDA symbols cannot catch these -- they
+ * look driver entry points up with dlsym(handle, ...), which never consults
+ * the preload -- but they all share this one step, loading the driver library,
+ * so we acquire just before a load of libcuda.
+ *
+ * With one exception: a dlopen of libcuda from inside another dlopen (depth
+ * tracked per thread below) is a library constructor resolving driver symbols
+ * for later, not use. libcublasLt and friends do exactly this when torch
+ * preloads them at import, and claiming there would put a card under every
+ * process that merely imports torch -- including the nvcc build workers that
+ * are kept off the GPU lock on purpose. Skipping nested loads is safe because
+ * every path that goes on to *use* the driver re-enters dlopen("libcuda.so.1")
+ * at top level first (dlopen of an already-loaded library just bumps its
+ * refcount): the runtime re-dlopens it when lazy-initializing, and
+ * ctypes-style users open it directly. Acquiring can block on a busy pool;
+ * that happens before chaining, so we never sleep holding the loader's locks.
+ *
+ * cuInit -- a program linked against libcuda directly never dlopens it (ld.so
+ * maps it at startup). Its driver-API calls resolve through the dynamic
+ * linker, where the preload wins, and every driver call requires a prior
+ * cuInit(), so hooking cuInit alone covers this road. */
 
 #define KT_NEXT(fnptr_type, name)                    \
   static fnptr_type real = NULL;                     \
   if (!real) real = (fnptr_type)dlsym(RTLD_NEXT, name)
+
+static __thread int g_dlopen_depth = 0;
+
+typedef void *(*dlopen_t)(const char *, int);
+void *dlopen(const char *filename, int flags) {
+  KT_NEXT(dlopen_t, "dlopen");
+  if (filename && g_dlopen_depth == 0) {
+    const char *base = strrchr(filename, '/');
+    base = base ? base + 1 : filename;
+    if (strncmp(base, "libcuda.so", 10) == 0) kt_ensure();
+  }
+  if (!real) return NULL;
+  g_dlopen_depth++;
+  void *handle = real(filename, flags);
+  g_dlopen_depth--;
+  return handle;
+}
 
 typedef int (*cuInit_t)(unsigned int);
 int cuInit(unsigned int flags) {
   kt_ensure();
   KT_NEXT(cuInit_t, "cuInit");
   return real ? real(flags) : 0;
-}
-
-typedef int (*cudaGetDeviceCount_t)(int *);
-int cudaGetDeviceCount(int *count) {
-  kt_ensure();
-  KT_NEXT(cudaGetDeviceCount_t, "cudaGetDeviceCount");
-  return real ? real(count) : 0;
-}
-
-typedef int (*cudaSetDevice_t)(int);
-int cudaSetDevice(int device) {
-  kt_ensure();
-  KT_NEXT(cudaSetDevice_t, "cudaSetDevice");
-  return real ? real(device) : 0;
-}
-
-typedef int (*cudaMalloc_t)(void **, size_t);
-int cudaMalloc(void **ptr, size_t size) {
-  kt_ensure();
-  KT_NEXT(cudaMalloc_t, "cudaMalloc");
-  return real ? real(ptr, size) : 0;
-}
-
-/* libcudart (CUDA 11.3+) looks driver symbols up through cuGetProcAddress
- * instead of the dynamic linker, which would hand it the real cuInit and
- * bypass the hook above. So we interpose the lookup itself: run the real
- * lookup, then substitute our cuInit wrapper for the result. v1 and v2 are
- * the two ABIs of the same function; both must be covered. */
-typedef int (*cuGetProcAddress_t)(const char *, void **, int, unsigned long long);
-int cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion,
-                     unsigned long long flags) {
-  KT_NEXT(cuGetProcAddress_t, "cuGetProcAddress");
-  int rc = real ? real(symbol, pfn, cudaVersion, flags) : -1;
-  if (symbol && pfn && strcmp(symbol, "cuInit") == 0) *pfn = (void *)cuInit;
-  return rc;
-}
-
-typedef int (*cuGetProcAddress_v2_t)(const char *, void **, int, unsigned long long,
-                                     void *);
-int cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
-                        unsigned long long flags, void *status) {
-  KT_NEXT(cuGetProcAddress_v2_t, "cuGetProcAddress_v2");
-  int rc = real ? real(symbol, pfn, cudaVersion, flags, status) : -1;
-  if (symbol && pfn && strcmp(symbol, "cuInit") == 0) *pfn = (void *)cuInit;
-  return rc;
 }

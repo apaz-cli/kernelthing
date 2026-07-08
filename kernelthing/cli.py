@@ -154,6 +154,9 @@ def resolve_problem(args: argparse.Namespace, cfg: Config) -> Problem:
 
 def run_loop(args: argparse.Namespace) -> int:
     gpus: list[int] = args.gpu if args.gpu else default_gpu()
+
+    from . import gpucontrol
+
     cfg = Config(
         model=args.model,
         opencode_timeout=args.timeout,
@@ -170,11 +173,18 @@ def run_loop(args: argparse.Namespace) -> int:
         elite_k=args.elite_k,
         min_niches=args.min_niches,
         problem_root=args.problem_root,
+        power_limit=args.power_limit,
+        gpu_clock_lock=gpucontrol.parse_mhz_pair(args.lock_clocks),
+        mem_clock_lock=gpucontrol.parse_mhz_pair(args.lock_mem),
     )
 
     from . import gpupool
 
     gpupool.warm_cache(gpus)
+
+    busy_warning = gpupool.check_busy_gpus(gpus)
+    if busy_warning:
+        print(f"[kernelthing] {busy_warning}", file=sys.stderr)
 
     if not args.override_gpu:
         arch_warning = gpupool.check_architecture_mismatch(gpus)
@@ -448,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
     models.add_argument(
         "--timeout",
         type=int,
-        default=1200,
+        default=3600,
         help="per-opencode-turn timeout in seconds (default: %(default)s)",
     )
 
@@ -500,6 +510,29 @@ def main(argv: list[str] | None = None) -> int:
         help="CUDA device index to pin (may be given multiple times, e.g. "
         "--gpu 0 --gpu 1). Defaults to $CUDA_VISIBLE_DEVICES "
         "when set, else [0].",
+    )
+    runtime.add_argument(
+        "--power-limit",
+        type=int,
+        default=None,
+        metavar="WATTS",
+        help="set GPU power limit before the seed baseline (requires root)",
+    )
+    runtime.add_argument(
+        "--lock-clocks",
+        type=str,
+        default=None,
+        metavar="MIN,MAX",
+        help="lock GPU core clock to a fixed range in MHz (e.g. '1500,1500'). "
+        "Requires root + idle GPU; applied before baseline, reset at exit.",
+    )
+    runtime.add_argument(
+        "--lock-mem",
+        type=str,
+        default=None,
+        metavar="MIN,MAX",
+        help="lock GPU memory clock to a fixed range in MHz. "
+        "Requires root + idle GPU; applied before baseline, reset at exit.",
     )
     runtime.add_argument(
         "--problem-root",

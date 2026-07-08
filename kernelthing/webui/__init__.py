@@ -37,8 +37,8 @@ from .. import journal
 
 _WEBUI_DIR = Path(__file__).resolve().parent
 
-# Member artifacts a client may fetch verbatim; "transcript" is the rendered
-# view of opencode.ndjson and handled separately.
+# Member artifacts a client may fetch verbatim; "transcript" is the structured
+# JSON view of opencode.ndjson and handled separately.
 MEMBER_FILES = {
     "prompt": "prompt.md",
     "summary": "summary.md",
@@ -131,12 +131,23 @@ def summarize_agent_log(path: Path) -> dict[str, Any]:
     return out
 
 
-def transcript_text(path: Path, lines: int = 800) -> str:
-    """Full readable transcript of an agent's NDJSON log (text + tool lines)."""
+def clip(text: str, head: int = 16000, tail: int = 8000) -> str:
+    """Clip huge tool output, keeping head and tail (errors usually sit at the end)."""
+    if len(text) <= head + tail + 64:
+        return text
+    omitted = len(text) - head - tail
+    return text[:head] + f"\n… [{omitted} chars omitted] …\n" + text[-tail:]
+
+
+def transcript_items(path: Path, lines: int = 8000) -> list[dict[str, Any]]:
+    """The agent's whole context as structured items for the transcript pane:
+    assistant prose (``text``), reasoning (``think`` -- the client renders it
+    collapsed), and tool calls (``tool``) with their complete input/output.
+    One item per NDJSON part, in stream order."""
+    items: list[dict[str, Any]] = []
     if not path.is_file():
-        return "(no transcript yet)"
-    out = []
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines()[-8000:]:
+        return items
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]:
         raw = raw.strip()
         if not raw:
             continue
@@ -145,11 +156,30 @@ def transcript_text(path: Path, lines: int = 800) -> str:
         except json.JSONDecodeError:
             continue
         part = d["part"] if "part" in d and isinstance(d["part"], dict) else {}
-        if d["type"] == "text" and "text" in part and part["text"]:
-            out.append("· " + " ".join(part["text"].split()))
+        ptype = part.get("type")
+        if d["type"] in ("reasoning", "thinking") or ptype in ("reasoning", "thinking"):
+            if part.get("text"):
+                items.append({"kind": "think", "text": part["text"]})
+        elif d["type"] == "text" and part.get("text"):
+            items.append({"kind": "text", "text": part["text"]})
         elif is_tool(d, part):
-            out.append("$ " + (tool_line(part) or "tool"))
-    return "\n".join(out[-lines:]) or "(no text yet)"
+            state = part["state"] if isinstance(part.get("state"), dict) else {}
+            inp = (
+                state["input"]
+                if isinstance(state.get("input"), dict)
+                else (part["input"] if isinstance(part.get("input"), dict) else {})
+            )
+            out = state.get("output") or state.get("error") or part.get("output") or ""
+            items.append(
+                {
+                    "kind": "tool",
+                    "line": tool_line(part) or "tool",
+                    "input": json.dumps(inp, indent=2) if inp else "",
+                    "output": clip(str(out)),
+                    "status": state.get("status") or "",
+                }
+            )
+    return items
 
 
 def make_handler(root: Path) -> type[BaseHTTPRequestHandler]:
@@ -160,11 +190,17 @@ def make_handler(root: Path) -> type[BaseHTTPRequestHandler]:
             if args and len(args) >= 2 and isinstance(args[1], int) and args[1] >= 400:
                 super().log_message(format, *args)
 
-        def _send(self, code: int, body: str | bytes, ctype: str = "application/json") -> None:
+        def _send(
+            self, code: int, body: str | bytes, ctype: str = "application/json",
+            etag: str | None = None,
+        ) -> None:
             data = body.encode() if isinstance(body, str) else body
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
+            if etag:
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(data)
 
@@ -243,9 +279,20 @@ def make_handler(root: Path) -> type[BaseHTTPRequestHandler]:
                     return
                 mdir = d / "members" / str(int(mid))
                 if which == "transcript":
-                    self._send(
-                        200, transcript_text(mdir / "opencode.ndjson"), "text/plain; charset=utf-8"
-                    )
+                    # The NDJSON log is append-only, so (mtime, size) identifies
+                    # its content; a 304 spares re-parsing and re-sending the
+                    # whole transcript on every poll while it's unchanged.
+                    f = mdir / "opencode.ndjson"
+                    try:
+                        st = f.stat()
+                        etag = f'"{st.st_mtime_ns}-{st.st_size}"'
+                    except OSError:
+                        etag = None
+                    if etag and self.headers.get("If-None-Match") == etag:
+                        self.send_response(304)
+                        self.end_headers()
+                        return
+                    self._send(200, json.dumps(transcript_items(f)), etag=etag)
                 elif which in MEMBER_FILES:
                     f = mdir / MEMBER_FILES[which]
                     txt = (

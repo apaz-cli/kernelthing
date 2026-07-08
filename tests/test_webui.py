@@ -237,8 +237,20 @@ def test_member_transcript_and_files(server, tmp_path: Path):
     dirs.ensure_member(3)
     dirs.member_log(3).write_text(
         _ndjson(
+            {"type": "reasoning", "part": {"type": "reasoning", "text": "consider tiling"}},
             {"type": "text", "part": {"text": "trying cp.async staging"}},
-            {"type": "tool_use", "part": {"name": "bash", "input": {"command": "nvcc a.cu"}}},
+            {
+                "type": "tool_use",
+                "part": {
+                    "type": "tool",
+                    "tool": "bash",
+                    "state": {
+                        "status": "completed",
+                        "input": {"command": "nvcc a.cu"},
+                        "output": "ok\n",
+                    },
+                },
+            },
         ),
         encoding="utf-8",
     )
@@ -246,10 +258,28 @@ def test_member_transcript_and_files(server, tmp_path: Path):
     rid = _run_id(dirs, tmp_path)
 
     _, tx = _get(port, f"/api/member?run={rid}&id=3&file=transcript")
-    assert "trying cp.async staging" in tx and "$ bash nvcc a.cu" in tx
+    items = json.loads(tx)
+    assert [it["kind"] for it in items] == ["think", "text", "tool"]
+    assert items[0]["text"] == "consider tiling"
+    assert items[1]["text"] == "trying cp.async staging"
+    assert items[2]["line"] == "bash nvcc a.cu"
+    assert items[2]["output"] == "ok\n" and items[2]["status"] == "completed"
+    assert json.loads(items[2]["input"]) == {"command": "nvcc a.cu"}
 
     _, prompt = _get(port, f"/api/member?run={rid}&id=3&file=prompt")
     assert prompt == "do the thing"
+
+    # An unchanged transcript revalidates to 304 instead of being re-sent.
+    url = f"http://127.0.0.1:{port}/api/member?run={rid}&id=3&file=transcript"
+    with urllib.request.urlopen(url) as r:
+        etag = r.headers["ETag"]
+    assert etag
+    req = urllib.request.Request(url, headers={"If-None-Match": etag})
+    try:
+        with urllib.request.urlopen(req) as r:
+            raise AssertionError(f"expected 304, got {r.status}")
+    except urllib.error.HTTPError as e:
+        assert e.code == 304
 
     # ids and file names are strictly validated: no traversal possible
     for bad in ("id=../3&file=prompt", "id=3&file=../../run.json"):

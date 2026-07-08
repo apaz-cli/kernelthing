@@ -113,6 +113,37 @@ input, select {
 input { width: 64px }
 select { max-width: 380px }
 
+/* member detail pane: prose inline, thinking + tool I/O collapsed (transcript tab) */
+.txpane {
+  background: var(--bg);
+  border: 1px solid var(--line2);
+  border-radius: 6px;
+  padding: 8px;
+  max-height: 60vh;
+  overflow: auto;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.txpane .say { margin: 6px 0; white-space: pre-wrap }
+.txpane details {
+  border: 1px solid var(--line2);
+  border-radius: 6px;
+  margin: 6px 0;
+  white-space: normal;
+}
+.txpane summary {
+  cursor: pointer;
+  padding: 3px 8px;
+  font: 12px ui-monospace, Menlo, monospace;
+  color: var(--mut);
+  user-select: none;
+}
+.txpane details.toolcall summary { color: var(--exploit) }
+.txpane details.think summary { font-style: italic }
+.txpane details .say { padding: 0 8px 6px; color: var(--dim) }
+.txpane .io { max-height: 260px; margin: 0 8px 8px }
+
 /* diff coloring (member detail pane, diff tab) */
 .d-add { color: var(--exploit) }
 .d-del { color: var(--bad) }
@@ -321,10 +352,8 @@ svg { display: block; width: 100% }
       <button class=mini data-tab=prompt onclick=setTab('prompt')>prompt</button>
       <button class=mini data-tab=diff onclick=setTab('diff')>diff</button>
       <button class=mini data-tab=summary onclick=setTab('summary')>summary</button>
-      <button class=mini data-tab=result onclick=setTab('result')>result</button>
-      <button class=mini data-tab=stderr onclick=setTab('stderr')>stderr</button>
     </span></h2>
-    <pre id=tx>—</pre></div>
+    <div id=tx class=txpane>—</div></div>
   <div class=card><h2>Controller log</h2><pre id=log>—</pre></div>
 </main>
 <script src="app.js"></script>

@@ -14,6 +14,7 @@ arrives through ``control.json``, re-read at dispatch boundaries.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import random
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -197,6 +199,44 @@ class Orchestrator:
     def _default_gpu(self) -> int:
         """First GPU in the pool (for seed, methodology, and other singleton ops)."""
         return self._gpu_indices[0]
+
+    @contextlib.contextmanager
+    def _hardware_locked(self) -> Iterator[None]:
+        """Lock GPU clocks and power limit for reproducible benchmarking.
+
+        Applied once before the seed baseline and held for the entire run;
+        reset on exit even on crash/KeyboardInterrupt. A no-op when no
+        hardware settings are configured.
+        """
+        cfg = self.cfg
+        if cfg.power_limit is None and cfg.gpu_clock_lock is None and cfg.mem_clock_lock is None:
+            yield
+            return
+        from . import gpucontrol
+
+        hw = gpucontrol.HardwareConfig(
+            power_limit_watts=cfg.power_limit,
+            gpu_clock_lock=cfg.gpu_clock_lock,
+            mem_clock_lock=cfg.mem_clock_lock,
+            device_ids=list(self._gpu_indices),
+        )
+        try:
+            with gpucontrol.HardwareLock(hw) as warnings:
+                if warnings:
+                    for w in warnings:
+                        self._log(f"HW  WARNING {w}")
+                else:
+                    parts = []
+                    if cfg.power_limit:
+                        parts.append(f"power {cfg.power_limit}W")
+                    if cfg.gpu_clock_lock:
+                        parts.append(f"gpu clk {cfg.gpu_clock_lock[0]}-{cfg.gpu_clock_lock[1]}MHz")
+                    if cfg.mem_clock_lock:
+                        parts.append(f"mem clk {cfg.mem_clock_lock[0]}-{cfg.mem_clock_lock[1]}MHz")
+                    self._log(f"HARDWARE locked: {', '.join(parts)}")
+                yield
+        finally:
+            self._log("HARDWARE reset to defaults")
 
     def _gpu_names(self) -> dict[str, str]:
         """Product name per pool GPU for run.json (cross-run comparability)."""
@@ -885,7 +925,8 @@ class Orchestrator:
         promotes the best kernel to HEAD.
         """
         try:
-            return self._run()
+            with self._hardware_locked():
+                return self._run()
         finally:
             if self.journal is not None:
                 self.journal.close()

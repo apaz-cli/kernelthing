@@ -94,7 +94,8 @@ function selectRun(id) {
   if (!id || id === RUN) return;
   RUN = id; OFFSET = 0; S = initState(); AGENTS = {}; selMember = null; LIVE = false;
   dirty.clear();
-  $('tx').textContent = '—'; $('txWho').textContent = 'select an agent or member';
+  $('tx').textContent = '—'; delete $('tx').dataset.raw;
+  $('txWho').textContent = 'select an agent or member';
   clearTimeout(pollTimer);
   poll();
 }
@@ -298,7 +299,7 @@ function drawLeaderboard(mem) {
   }).join('');
 }
 
-/* ---------- member detail pane (transcript / prompt / diff / summary / result) ---------- */
+/* ---------- member detail pane (transcript / prompt / diff / summary) ---------- */
 function loadMember(id) {
   selMember = id;
   $('txWho').textContent = 'mem ' + id;
@@ -328,6 +329,25 @@ function renderDiff(t) {
   }).join('\n');
 }
 
+// The whole agent context, opencode-style: assistant prose inline, thinking and
+// tool input/output as <details> collapsed by default. The item list is
+// append-only while the agent runs, so indices are stable and open state
+// survives a live re-render (restored by data-i).
+function renderTranscript(items) {
+  return items.map((it, i) => {
+    if (it.kind === 'text') return `<div class=say>${esc(it.text)}</div>`;
+    if (it.kind === 'think')
+      return `<details class=think data-i=${i}><summary>thinking</summary><div class=say>${esc(it.text)}</div></details>`;
+    if (it.kind === 'tool') {
+      const st = it.status && it.status !== 'completed' ? ` · ${esc(it.status)}` : '';
+      const body = (it.input ? `<pre class=io>${esc(it.input)}</pre>` : '') +
+        (it.output ? `<pre class=io>${esc(it.output)}</pre>` : '<div class="say muted">(no output)</div>');
+      return `<details class=toolcall data-i=${i}><summary>${esc(it.line)}${st}</summary>${body}</details>`;
+    }
+    return '';
+  }).join('');
+}
+
 async function refreshTx(jump) {
   if (selMember == null) return;
   try {
@@ -337,7 +357,13 @@ async function refreshTx(jump) {
     if (p.dataset.raw !== t) {
       p.dataset.raw = t;
       if (selTab === 'diff') p.innerHTML = renderDiff(t);
-      else p.textContent = t;
+      else if (selTab === 'transcript') {
+        const open = new Set([...p.querySelectorAll('details[open]')].map(d => d.dataset.i));
+        let items = [];
+        try { items = JSON.parse(t); } catch (e) {}
+        p.innerHTML = renderTranscript(items) || '(no transcript yet)';
+        for (const d of p.querySelectorAll('details')) if (open.has(d.dataset.i)) d.open = true;
+      } else p.textContent = t;
       if (jump || atBottom) p.scrollTop = p.scrollHeight;
     }
     if (jump && selTab !== 'transcript') p.scrollTop = 0;

@@ -323,3 +323,61 @@ def candidate_gpus(preferred: list[int] | None = None,
     if gpus:
         return [int(g["index"]) for g in gpus]  # type: ignore[call-overload]
     return [0]
+
+
+def check_busy_gpus(indices: list[int], min_free_memory_gb: float = 1.0) -> str | None:
+    """If any of the given GPUs is occupied by another workload, return a
+    warning message suitable for display. Returns ``None`` when all are free
+    or information is unavailable.
+
+    A GPU counts as busy when it has a running compute process or less than
+    ``min_free_memory_gb`` of free VRAM. Purely advisory — the ``libktgpu.so``
+    shim's ``flock`` is the real mutual exclusion; kernelthing queues on a
+    busy card rather than misbehave. This just tells the user the pool isn't
+    fully available.
+    """
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        return None
+    busy: set[int] = set()
+
+    # Compute processes on our cards, matched by UUID (cached via warm_cache).
+    uuid_to_idx = {gpu_uuid(i): i for i in indices}
+    with contextlib.suppress(Exception):
+        r = subprocess.run(
+            [smi, "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.strip().splitlines():
+                uuid = line.split(",")[0].strip()
+                if uuid in uuid_to_idx:
+                    busy.add(uuid_to_idx[uuid])
+
+    # A card with almost no free VRAM is occupied even without a visible process.
+    min_free_mb = min_free_memory_gb * 1024.0
+    with contextlib.suppress(Exception):
+        r = subprocess.run(
+            [smi, "--query-gpu=index,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 3 or not parts[0].isdigit() or int(parts[0]) not in indices:
+                    continue
+                with contextlib.suppress(ValueError):
+                    used_mb, total_mb = float(parts[1]), float(parts[2])
+                    if total_mb > 0 and total_mb - used_mb < min_free_mb:
+                        busy.add(int(parts[0]))
+
+    if not busy:
+        return None
+    names = [f"GPU {i} ({gpu_name(i)})" for i in sorted(busy)]
+    return (
+        f"WARNING: {', '.join(names)} appear busy (running compute processes). "
+        "The shim will queue on these cards — scoring will still work but will "
+        "block until the other workload finishes."
+    )
+
